@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -32,6 +34,9 @@ import (
 )
 
 var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+
+// percentPattern matches percentage strings like "70%".
+var percentPattern = regexp.MustCompile(`^([0-9]+)%$`)
 
 // PoolAutoscalerValidatingHandler handles admission validation for PoolAutoscaler.
 type PoolAutoscalerValidatingHandler struct {
@@ -87,9 +92,9 @@ func validatePoolAutoscalerSpec(spec agentsv1alpha1.PoolAutoscalerSpec, fldPath 
 	if spec.MinReplicas < 0 {
 		errList = append(errList, field.Invalid(fldPath.Child("minReplicas"), spec.MinReplicas, "must be >= 0"))
 	}
-	if spec.MinReplicas > 0 && spec.MinReplicas >= spec.MaxReplicas {
+	if spec.MinReplicas > spec.MaxReplicas {
 		errList = append(errList, field.Invalid(fldPath.Child("minReplicas"), spec.MinReplicas,
-			fmt.Sprintf("must be < maxReplicas (%d)", spec.MaxReplicas)))
+			fmt.Sprintf("must be <= maxReplicas (%d)", spec.MaxReplicas)))
 	}
 
 	// Validate cron policies
@@ -144,12 +149,10 @@ func validateCapacityPolicy(policy *agentsv1alpha1.CapacityPolicy, fldPath *fiel
 	var errList field.ErrorList
 
 	// Validate targetAvailable
-	errList = append(errList, validateIntOrPercentNonNegative(policy.TargetAvailable, fldPath.Child("targetAvailable"))...)
+	errList = append(errList, validateIntOrPercent(&policy.TargetAvailable, fldPath.Child("targetAvailable"), 100)...)
 
 	// Validate tolerance
-	if policy.Tolerance != nil {
-		errList = append(errList, validateIntOrPercentNonNegative(*policy.Tolerance, fldPath.Child("tolerance"))...)
-	}
+	errList = append(errList, validateIntOrPercent(policy.Tolerance, fldPath.Child("tolerance"), 100)...)
 
 	// Validate stabilization windows
 	if policy.ScaleUp != nil && policy.ScaleUp.StabilizationWindowSeconds != nil {
@@ -170,14 +173,33 @@ func validateCapacityPolicy(policy *agentsv1alpha1.CapacityPolicy, fldPath *fiel
 	return errList
 }
 
-func validateIntOrPercentNonNegative(val intstr.IntOrString, fldPath *field.Path) field.ErrorList {
+// validateIntOrPercent validates an IntOrString value used as an absolute count
+// or a percentage. Integers must be >= 0; strings must be a percentage of the
+// form "<number>%" with the numeric portion within [0, allowedMax].
+func validateIntOrPercent(v *intstr.IntOrString, fldPath *field.Path, allowedMax int) field.ErrorList {
 	var errList field.ErrorList
-	if val.Type == intstr.Int {
-		if val.IntVal < 0 {
-			errList = append(errList, field.Invalid(fldPath, val.IntVal, "must be >= 0"))
-		}
+	if v == nil {
+		return errList
 	}
-	// Percentage validation: the string format is handled by Kubernetes intstr parsing
+	switch v.Type {
+	case intstr.Int:
+		if v.IntVal < 0 {
+			errList = append(errList, field.Invalid(fldPath, v.IntVal, "must be >= 0"))
+		}
+	case intstr.String:
+		matches := percentPattern.FindStringSubmatch(v.StrVal)
+		if matches == nil {
+			errList = append(errList, field.Invalid(fldPath, v.StrVal, `must be a percentage in the form "<number>%" (e.g. "70%")`))
+			return errList
+		}
+		percent, err := strconv.Atoi(matches[1])
+		if err != nil || percent > allowedMax {
+			errList = append(errList, field.Invalid(fldPath, v.StrVal,
+				fmt.Sprintf("percentage must be between 0 and %d", allowedMax)))
+		}
+	default:
+		errList = append(errList, field.Invalid(fldPath, v, "must be an integer or a percentage string"))
+	}
 	return errList
 }
 
@@ -185,8 +207,10 @@ func validateIntOrPercentNonNegative(val intstr.IntOrString, fldPath *field.Path
 func (h *PoolAutoscalerValidatingHandler) validateOneToOne(ctx context.Context, obj *agentsv1alpha1.PoolAutoscaler) field.ErrorList {
 	var errList field.ErrorList
 	list := &agentsv1alpha1.PoolAutoscalerList{}
-	if err := h.Client.List(ctx, list, client.InNamespace(obj.Namespace),
-		client.MatchingFields{"spec.scaleTargetRef.name": obj.Spec.ScaleTargetRef.Name}); err != nil {
+	// List all PoolAutoscalers in the namespace and filter manually. The webhook
+	// must not rely on the field index registered by the controller: when the
+	// PoolAutoscaler feature gate is disabled the index does not exist.
+	if err := h.Client.List(ctx, list, client.InNamespace(obj.Namespace)); err != nil {
 		errList = append(errList, field.InternalError(field.NewPath("spec").Child("scaleTargetRef"),
 			fmt.Errorf("failed to list PoolAutoscalers: %w", err)))
 		return errList
@@ -194,6 +218,9 @@ func (h *PoolAutoscalerValidatingHandler) validateOneToOne(ctx context.Context, 
 
 	for i := range list.Items {
 		existing := &list.Items[i]
+		if existing.Spec.ScaleTargetRef.Name != obj.Spec.ScaleTargetRef.Name {
+			continue
+		}
 		// Skip self on update
 		if existing.Name == obj.Name && existing.Namespace == obj.Namespace {
 			continue

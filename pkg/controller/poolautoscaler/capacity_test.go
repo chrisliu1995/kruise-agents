@@ -93,11 +93,13 @@ func TestResolveIntOrPercent(t *testing.T) {
 
 func TestClampToBounds(t *testing.T) {
 	tests := []struct {
-		name        string
-		minReplicas int32
-		maxReplicas int32
-		desired     int32
-		expected    int32
+		name              string
+		minReplicas       int32
+		maxReplicas       int32
+		desired           int32
+		expected          int32
+		expectLimited     bool
+		expectLimitReason string
 	}{
 		{
 			name:        "within bounds",
@@ -107,18 +109,22 @@ func TestClampToBounds(t *testing.T) {
 			expected:    10,
 		},
 		{
-			name:        "below min",
-			minReplicas: 5,
-			maxReplicas: 20,
-			desired:     2,
-			expected:    5,
+			name:              "below min",
+			minReplicas:       5,
+			maxReplicas:       20,
+			desired:           2,
+			expected:          5,
+			expectLimited:     true,
+			expectLimitReason: "TooFewReplicas",
 		},
 		{
-			name:        "above max",
-			minReplicas: 5,
-			maxReplicas: 20,
-			desired:     30,
-			expected:    20,
+			name:              "above max",
+			minReplicas:       5,
+			maxReplicas:       20,
+			desired:           30,
+			expected:          20,
+			expectLimited:     true,
+			expectLimitReason: "TooManyReplicas",
 		},
 		{
 			name:        "nil minReplicas defaults to 0",
@@ -152,19 +158,26 @@ func TestClampToBounds(t *testing.T) {
 					MaxReplicas: tt.maxReplicas,
 				},
 			}
-			result := r.clampToBounds(pa, tt.desired)
+			result, limited, limitReason := r.clampToBounds(pa, tt.desired)
 			assert.Equal(t, tt.expected, result)
+			assert.Equal(t, tt.expectLimited, limited)
+			assert.Equal(t, tt.expectLimitReason, limitReason)
 		})
 	}
 }
 
 func TestComputeDesiredReplicas(t *testing.T) {
+	// A full observation window with the default flags holds
+	// observationWindowSeconds/samplingIntervalSeconds samples.
+	fullWindowSamples := observationWindowSeconds / samplingIntervalSeconds
+
 	tests := []struct {
 		name            string
 		capacityPolicy  *agentsv1alpha1.CapacityPolicy
 		specReplicas    int32
 		statusReplicas  int32
 		available       int32
+		sampleCount     int // 0 means use a full window
 		expectedDesired int32
 		expectedReason  string
 	}{
@@ -216,11 +229,26 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			specReplicas:    5,
+			statusReplicas:  5,
+			available:       4, // below lower=6, inFlight=1, deficit=7-4-1=2
+			expectedDesired: 7, // statusReplicas(5) + 2 = 7
+			expectedReason:  "available below lower watermark",
+		},
+		{
+			name: "absolute: in-flight replicas suppress repeated scale-up",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(7),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
 			specReplicas:    10,
 			statusReplicas:  10,
-			available:       4,  // below lower=6, target=7, deficit=7-4=3
-			expectedDesired: 13, // statusReplicas(10) + 3 = 13
-			expectedReason:  "available below lower watermark",
+			available:       4,  // below lower=6, but inFlight=6 covers the deficit
+			expectedDesired: 10, // no additional scale-up while pods are starting
+			expectedReason:  "waiting for in-flight sandboxes to become available",
 		},
 		{
 			name: "absolute: available in dead zone — stable",
@@ -253,6 +281,22 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			expectedReason:  "available above upper watermark",
 		},
 		{
+			name: "insufficient samples block scale-down",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(7),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
+			specReplicas:    10,
+			statusReplicas:  10,
+			available:       9, // above upper=8, but only one sample observed
+			sampleCount:     1,
+			expectedDesired: 10,
+			expectedReason:  "insufficient observation samples for scale-down",
+		},
+		{
 			name: "percentage: convergence step 10→7",
 			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromString("70%"),
@@ -268,7 +312,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			expectedReason:  "available above upper watermark",
 		},
 		{
-			name: "percentage: low readiness — scale up by deficit",
+			name: "percentage: low readiness with in-flight replicas — wait",
 			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromString("70%"),
 				Tolerance: func() *intstr.IntOrString {
@@ -278,9 +322,9 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			},
 			specReplicas:    10,
 			statusReplicas:  10,
-			available:       5,  // target=7, lower=6, 5<6 → deficit=7-5=2
-			expectedDesired: 12, // 10 + 2 = 12
-			expectedReason:  "available below lower watermark",
+			available:       5,  // target=7, lower=6, 5<6 but inFlight=5 covers deficit
+			expectedDesired: 10, // wait for in-flight replicas instead of stacking
+			expectedReason:  "waiting for in-flight sandboxes to become available",
 		},
 	}
 
@@ -297,14 +341,51 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			pa.Name = "test-pa"
 			pa.Namespace = "default"
 
+			sampleCount := tt.sampleCount
+			if sampleCount == 0 {
+				sampleCount = fullWindowSamples
+			}
 			result, err := r.computeDesiredReplicas(
 				context.Background(), pa,
-				tt.specReplicas, tt.statusReplicas, tt.available,
+				tt.specReplicas, tt.statusReplicas, tt.available, sampleCount,
 			)
 			assert.NoError(t, err)
 			assert.Equal(t, tt.expectedDesired, result.desiredReplicas, "desired replicas mismatch")
 			assert.Contains(t, result.reason, tt.expectedReason)
 		})
+	}
+}
+
+// TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp is a regression test
+// for the runaway scale-up bug: when sandboxes stay in Creating for a long
+// time, statusReplicas catches up with specReplicas while available remains 0.
+// Every subsequent evaluation must NOT add a fresh deficit on top of the
+// previous scale-up.
+func TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp(t *testing.T) {
+	r := &Reconciler{
+		monitors: make(map[types.NamespacedName]*capacityMonitor),
+	}
+	pa := &agentsv1alpha1.PoolAutoscaler{
+		Spec: agentsv1alpha1.PoolAutoscalerSpec{
+			CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(10),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(2)
+					return &v
+				}(),
+			},
+		},
+	}
+	pa.Name = "test-pa"
+	pa.Namespace = "default"
+
+	// spec=10, statusReplicas caught up to 10 (all Creating), available=0.
+	// Repeated evaluations must keep desired at 10 instead of stacking deficits.
+	for i := 0; i < 5; i++ {
+		result, err := r.computeDesiredReplicas(context.Background(), pa, 10, 10, 0, 3)
+		require.NoError(t, err)
+		assert.Equal(t, int32(10), result.desiredReplicas, "iteration %d must not scale up again", i)
+		assert.Contains(t, result.reason, "waiting for in-flight sandboxes to become available")
 	}
 }
 
@@ -740,12 +821,12 @@ func TestObserveAndAggregate(t *testing.T) {
 			tt.setupMonitor(monitor)
 			r.monitors[key] = monitor
 
-			avail, status := r.observeAndAggregate(
+			avail, status, _ := r.observeAndAggregate(
 				context.Background(), pa, tt.rawAvailable, tt.rawStatusReplicas,
 			)
 
 			if tt.hasSecondCall {
-				avail, status = r.observeAndAggregate(
+				avail, status, _ = r.observeAndAggregate(
 					context.Background(), pa, tt.secondAvailable, tt.secondStatus,
 				)
 			}
@@ -894,10 +975,11 @@ func TestApplyStabilizationWindow_Cooldown(t *testing.T) {
 			tt.setupMonitor(monitor)
 			r.monitors[key] = monitor
 
-			result := r.applyStabilizationWindow(
+			result, blocked, _ := r.applyStabilizationWindow(
 				pa, tt.specReplicas, tt.desiredReplicas,
 			)
 			assert.Equal(t, tt.expected, result)
+			assert.Equal(t, tt.expected != tt.desiredReplicas, blocked)
 		})
 	}
 }
@@ -1014,10 +1096,11 @@ func TestApplyStabilizationWindow_DefaultWindow(t *testing.T) {
 			tt.setupMonitor(monitor)
 			r.monitors[key] = monitor
 
-			result := r.applyStabilizationWindow(
+			result, blocked, _ := r.applyStabilizationWindow(
 				pa, tt.specReplicas, tt.desiredReplicas,
 			)
 			assert.Equal(t, tt.expected, result)
+			assert.Equal(t, tt.expected != tt.desiredReplicas, blocked)
 		})
 	}
 }
@@ -1036,17 +1119,87 @@ func TestGetOrCreateMonitor_CreationPath(t *testing.T) {
 	assert.False(t, exists)
 
 	// Call observeAndAggregate - should create monitor internally
-	avgAvail, avgStatus := r.observeAndAggregate(context.Background(), pa, 10, 20)
+	avgAvail, avgStatus, sampleCount := r.observeAndAggregate(context.Background(), pa, 10, 20)
 
 	// With a single sample added, aggregated values equal the raw values
 	assert.Equal(t, int32(10), avgAvail)
 	assert.Equal(t, int32(20), avgStatus)
+	assert.Equal(t, 1, sampleCount)
 
 	// Monitor was created
 	m, ok := r.monitors[key]
 	assert.True(t, ok)
 	assert.NotNil(t, m)
 	assert.Len(t, m.samples, 1) // first sample was added
+}
+
+// TestGetOrCreateMonitorFor_IdentityChange verifies that a monitor is
+// discarded and recreated when the PoolAutoscaler UID or targetRef changes,
+// so stale samples and cooldowns never leak across object lifecycles.
+func TestGetOrCreateMonitorFor_IdentityChange(t *testing.T) {
+	tests := []struct {
+		name            string
+		existingUID     types.UID
+		existingTarget  string
+		requestUID      types.UID
+		requestTarget   string
+		expectSameMonit bool
+	}{
+		{
+			name:            "same uid and targetRef - monitor reused",
+			existingUID:     "uid-1",
+			existingTarget:  "sbs-1",
+			requestUID:      "uid-1",
+			requestTarget:   "sbs-1",
+			expectSameMonit: true,
+		},
+		{
+			name:            "uid changed (PA recreated) - monitor discarded",
+			existingUID:     "uid-1",
+			existingTarget:  "sbs-1",
+			requestUID:      "uid-2",
+			requestTarget:   "sbs-1",
+			expectSameMonit: false,
+		},
+		{
+			name:            "targetRef changed (PA retargeted) - monitor discarded",
+			existingUID:     "uid-1",
+			existingTarget:  "sbs-1",
+			requestUID:      "uid-1",
+			requestTarget:   "sbs-2",
+			expectSameMonit: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Reconciler{monitors: make(map[types.NamespacedName]*capacityMonitor)}
+			key := types.NamespacedName{Namespace: "default", Name: "test-pa"}
+			existing := &capacityMonitor{
+				paUID:     tt.existingUID,
+				targetRef: tt.existingTarget,
+				samples: []sample{
+					{timestamp: time.Now(), available: 5, statusReplicas: 10},
+				},
+				lastScaleUpAt: time.Now(),
+			}
+			r.monitors[key] = existing
+
+			got := r.getOrCreateMonitorFor(key, tt.requestUID, tt.requestTarget)
+
+			if tt.expectSameMonit {
+				assert.Same(t, existing, got)
+				assert.Len(t, got.samples, 1)
+			} else {
+				assert.NotSame(t, existing, got)
+				assert.Empty(t, got.samples, "stale samples must not leak into the new monitor")
+				assert.True(t, got.lastScaleUpAt.IsZero(), "stale cooldowns must not leak into the new monitor")
+				assert.Equal(t, tt.requestUID, got.paUID)
+				assert.Equal(t, tt.requestTarget, got.targetRef)
+				assert.Same(t, got, r.monitors[key], "new monitor must replace the stale one")
+			}
+		})
+	}
 }
 
 // TestDeleteMonitor verifies that deleteMonitor removes the capacity

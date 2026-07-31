@@ -27,6 +27,7 @@ var PoolAutoscalerControllerKind = GroupVersion.WithKind("PoolAutoscaler")
 type CrossVersionObjectReference struct {
 	// Kind of the referent; More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
 	// +required
+	// +kubebuilder:validation:Enum=SandboxSet
 	Kind string `json:"kind"`
 	// Name of the referent; More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
 	// +required
@@ -37,6 +38,7 @@ type CrossVersionObjectReference struct {
 }
 
 // PoolAutoscalerSpec describes the desired functionality of the PoolAutoscaler.
+// +kubebuilder:validation:XValidation:rule="self.minReplicas <= self.maxReplicas",message="minReplicas must not be greater than maxReplicas"
 type PoolAutoscalerSpec struct {
 	// ScaleTargetRef points to the target warming pool to scale, and is used to select the pods for which instance status
 	// should be collected, as well as to actually change the replica count.
@@ -46,11 +48,13 @@ type PoolAutoscalerSpec struct {
 	// MaxReplicas is the upper limit for the number of replicas to which the autoscaler can scale up.
 	// It cannot be less than minReplicas.
 	// +required
+	// +kubebuilder:validation:Minimum=1
 	MaxReplicas int32 `json:"maxReplicas"`
 
 	// MinReplicas is the lower limit for the number of replicas to which the autoscaler
 	// can scale down. It defaults to 0 pods.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
 	MinReplicas int32 `json:"minReplicas"`
 
 	// CronPolicies is a list of potential cron scaling policies which can be used during scaling.
@@ -86,6 +90,7 @@ type CronScalingPolicy struct {
 
 	// TargetReplicas is the desired replicas when this policy executes.
 	// +required
+	// +kubebuilder:validation:Minimum=0
 	TargetReplicas int32 `json:"targetReplicas"`
 }
 
@@ -114,11 +119,15 @@ type CapacityPolicy struct {
 
 // CapacityScalingRules configures the scaling behavior for one direction.
 type CapacityScalingRules struct {
-	// StabilizationWindowSeconds is the number of seconds for which past recommendations should be
-	// considered while scaling up or scaling down.
+	// StabilizationWindowSeconds is the cooldown period after any scale action before
+	// a scale in this direction is allowed. This is a cooldown model: the first scale
+	// action is immediate, subsequent actions must wait for the window to elapse since
+	// the most recent scale action (in either direction).
 	// Must be >= 0 and <= 3600 (one hour).
 	// Defaults: scale up: 0, scale down: 300.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=3600
 	StabilizationWindowSeconds *int32 `json:"stabilizationWindowSeconds,omitempty"`
 }
 
@@ -152,6 +161,8 @@ type PoolAutoscalerStatus struct {
 
 	// Conditions is the set of conditions required for this autoscaler to scale its target.
 	// +optional
+	// +listType=map
+	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 

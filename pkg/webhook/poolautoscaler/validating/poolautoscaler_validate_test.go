@@ -124,7 +124,19 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 				MaxReplicas: 10,
 				MinReplicas: 20,
 			},
-			expectError: "must be < maxReplicas",
+			expectError: "must be <= maxReplicas",
+		},
+		{
+			name: "minReplicas equals maxReplicas - valid (fixed pool size)",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 10,
+				MinReplicas: 10,
+			},
+			expectError: "",
 		},
 		{
 			name: "cron and capacity policies coexist - valid",
@@ -232,6 +244,93 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 			},
 			expectError: "",
 		},
+		{
+			name: "valid percentage target and tolerance",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("70%"),
+					Tolerance:       intOrStrPtr(intstr.FromString("10%")),
+				},
+			},
+			expectError: "",
+		},
+		{
+			name: "targetAvailable malformed percentage string",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("70"),
+				},
+			},
+			expectError: "must be a percentage in the form",
+		},
+		{
+			name: "targetAvailable percentage above 100",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("150%"),
+				},
+			},
+			expectError: "percentage must be between 0 and 100",
+		},
+		{
+			name: "negative targetAvailable integer",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(-1),
+				},
+			},
+			expectError: "must be >= 0",
+		},
+		{
+			name: "tolerance malformed percentage string",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(10),
+					Tolerance:       intOrStrPtr(intstr.FromString("10%%")),
+				},
+			},
+			expectError: "must be a percentage in the form",
+		},
+		{
+			name: "negative tolerance integer",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(10),
+					Tolerance:       intOrStrPtr(intstr.FromInt32(-2)),
+				},
+			},
+			expectError: "must be >= 0",
+		},
 	}
 
 	for _, tt := range tests {
@@ -255,6 +354,10 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 }
 
 func int32Ptr(v int32) *int32 {
+	return &v
+}
+
+func intOrStrPtr(v intstr.IntOrString) *intstr.IntOrString {
 	return &v
 }
 
@@ -332,14 +435,9 @@ func TestHandle(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fc := fake.NewClientBuilder().WithScheme(scheme).
-				WithIndex(&agentsv1alpha1.PoolAutoscaler{}, "spec.scaleTargetRef.name", func(obj client.Object) []string {
-					pa := obj.(*agentsv1alpha1.PoolAutoscaler)
-					if pa.Spec.ScaleTargetRef.Name == "" {
-						return nil
-					}
-					return []string{pa.Spec.ScaleTargetRef.Name}
-				}).Build()
+			// No field index registered: the webhook must work without the
+			// controller-registered index (e.g. when the feature gate is off).
+			fc := fake.NewClientBuilder().WithScheme(scheme).Build()
 			h := &PoolAutoscalerValidatingHandler{
 				Client:  fc,
 				Decoder: decoder,
@@ -432,14 +530,9 @@ func TestValidateOneToOne(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.existingPAs...).
-				WithIndex(&agentsv1alpha1.PoolAutoscaler{}, "spec.scaleTargetRef.name", func(obj client.Object) []string {
-					pa := obj.(*agentsv1alpha1.PoolAutoscaler)
-					if pa.Spec.ScaleTargetRef.Name == "" {
-						return nil
-					}
-					return []string{pa.Spec.ScaleTargetRef.Name}
-				}).Build()
+			// No field index registered: validateOneToOne lists and filters
+			// manually so it works without the controller-registered index.
+			fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.existingPAs...).Build()
 			h := &PoolAutoscalerValidatingHandler{Client: fc}
 			errList := h.validateOneToOne(context.Background(), tt.targetPA)
 			if tt.expectError == "" {

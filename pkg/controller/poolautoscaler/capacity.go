@@ -18,7 +18,6 @@ package poolautoscaler
 
 import (
 	"context"
-	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -31,9 +30,17 @@ import (
 )
 
 const (
-	defaultTolerancePercent       = 10
 	defaultScaleDownStabilization = 300 // seconds
 	defaultScaleUpStabilization   = 0   // seconds
+)
+
+// scalingPolicySource identifies which policy produced a scaling decision.
+type scalingPolicySource string
+
+const (
+	sourceBounds   scalingPolicySource = "bounds"
+	sourceCapacity scalingPolicySource = "capacity"
+	sourceCron     scalingPolicySource = "cron"
 )
 
 // Observation window parameters — set once via command-line flags at startup
@@ -53,6 +60,12 @@ type sample struct {
 // capacityMonitor tracks sustained-condition timers for a single PoolAutoscaler.
 type capacityMonitor struct {
 	mu sync.Mutex
+
+	// Identity of the PoolAutoscaler this monitor belongs to. When the PA is
+	// recreated (UID change) or retargeted (targetRef change), the accumulated
+	// samples and cooldown timestamps are stale and the monitor is discarded.
+	paUID     types.UID
+	targetRef string
 
 	// Observation window samples. Continuously maintained — NOT cleared
 	// after scaling. Each sample captures (available, statusReplicas)
@@ -162,83 +175,105 @@ type computeDesiredReplicasResult struct {
 	desiredReplicas     int32
 	reason              string
 	appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus
-	cronTriggered       bool // true when a cron policy determined the desired replicas
+	source              scalingPolicySource // which policy determined the desired replicas
 }
 
-func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, specReplicas, statusReplicas, available int32) (computeDesiredReplicasResult, error) {
+func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, specReplicas, avgReplicas, avgAvailable int32, sampleCount int) (computeDesiredReplicasResult, error) {
 	logger := klog.FromContext(ctx)
 
 	// Evaluate cron policies first — cron takes priority over capacity when triggered.
+	// The cron statuses are kept even when no policy triggered, so that the capacity
+	// path below still carries them for status reporting.
+	var cronStatuses []agentsv1alpha1.CronScalingPolicyStatus
 	if len(pa.Spec.CronPolicies) > 0 {
-		desired, reason, cronStatuses, err := r.computeCronDesiredReplicas(ctx, pa, specReplicas, time.Now())
+		desired, reason, statuses, err := r.computeCronDesiredReplicas(ctx, pa, specReplicas, time.Now())
 		if err != nil {
 			return computeDesiredReplicasResult{}, err
 		}
+		cronStatuses = statuses
 		// If a cron policy has triggered, use its targetReplicas directly.
 		if reason != ReasonNoCronTriggered {
 			logger.V(3).Info("Cron policy triggered, overriding capacity", "reason", reason, "desired", desired)
-			return computeDesiredReplicasResult{desired, reason, cronStatuses, true}, nil
+			return computeDesiredReplicasResult{desired, reason, cronStatuses, sourceCron}, nil
 		}
 	}
 
 	if pa.Spec.CapacityPolicy == nil {
-		return computeDesiredReplicasResult{specReplicas, "no scaling policy", nil, false}, nil
+		return computeDesiredReplicasResult{specReplicas, "no scaling policy", cronStatuses, sourceBounds}, nil
 	}
 
-	// Use statusReplicas as the percentage base.
+	// Use avgReplicas as the percentage base.
 	// Combined with the SandboxSet watch, the autoscaler reacts immediately
 	// when available drops after claims.
 	targetAvailable, lowerWatermark, upperWatermark := computeWatermarks(
 		pa.Spec.CapacityPolicy.TargetAvailable,
 		pa.Spec.CapacityPolicy.Tolerance,
-		statusReplicas,
+		avgReplicas,
 	)
 
 	logger.V(5).Info("Capacity policy evaluation",
 		"specReplicas", specReplicas,
-		"statusReplicas", statusReplicas,
-		"available", available,
+		"avgReplicas", avgReplicas,
+		"avgAvailable", avgAvailable,
 		"targetAvailable", targetAvailable,
 		"lowerWatermark", lowerWatermark,
 		"upperWatermark", upperWatermark,
 	)
 
 	// Scale up: available dropped below lower watermark.
-	// desired = statusReplicas + deficit
+	// desired = avgReplicas + deficit
 	// Guard: don't scale up further while a previous scale-up is still in progress
 	// (pods are being created). This prevents runaway feedback loops.
-	if available < lowerWatermark {
-		if specReplicas > statusReplicas {
-			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-up to complete", nil, false}, nil
+	if avgAvailable < lowerWatermark {
+		if specReplicas > avgReplicas {
+			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-up to complete", cronStatuses, sourceCapacity}, nil
 		}
-		deficit := targetAvailable - available
-		desired := statusReplicas + deficit
-		if desired < 0 {
-			desired = 0
+		// In-flight replicas: created but not yet available (still starting up).
+		// The deficit must exclude them, otherwise every reconcile while pods are
+		// Creating would add a fresh deficit on top of the previous scale-up.
+		// Treating all non-available replicas as in-flight is conservative: it may
+		// under-scale when many replicas are claimed, but claims consume sandboxes
+		// which leave the set and trigger replenishment by the SandboxSet
+		// controller itself.
+		inFlight := avgReplicas - avgAvailable
+		if inFlight < 0 {
+			inFlight = 0
 		}
-		return computeDesiredReplicasResult{desired, "available below lower watermark", nil, false}, nil
+		deficit := targetAvailable - avgAvailable - inFlight
+		if deficit <= 0 {
+			return computeDesiredReplicasResult{specReplicas, "waiting for in-flight sandboxes to become available", cronStatuses, sourceCapacity}, nil
+		}
+		desired := avgReplicas + deficit
+		return computeDesiredReplicasResult{desired, "available below lower watermark", cronStatuses, sourceCapacity}, nil
 	}
 
 	// Scale down: available exceeded upper watermark.
-	// desired = statusReplicas - excess
-	if available > upperWatermark {
-		excess := available - targetAvailable
-		desired := statusReplicas - excess
+	// desired = avgReplicas - excess
+	if avgAvailable > upperWatermark {
+		// Warm-up guard: never scale down before the observation window is fully
+		// populated (e.g. right after controller restart). Scale-up above stays
+		// unrestricted so capacity shortage is still handled promptly.
+		expectedSamples := observationWindowSeconds / samplingIntervalSeconds
+		if sampleCount < expectedSamples {
+			return computeDesiredReplicasResult{specReplicas, "insufficient observation samples for scale-down", cronStatuses, sourceCapacity}, nil
+		}
+		excess := avgAvailable - targetAvailable
+		desired := avgReplicas - excess
 		if desired < 0 {
 			desired = 0
 		}
-		return computeDesiredReplicasResult{desired, "available above upper watermark", nil, false}, nil
+		return computeDesiredReplicasResult{desired, "available above upper watermark", cronStatuses, sourceCapacity}, nil
 	}
 
 	// Within dead zone [lower, upper] — stable, no change.
-	return computeDesiredReplicasResult{specReplicas, "within tolerance", nil, false}, nil
+	return computeDesiredReplicasResult{specReplicas, "within tolerance", cronStatuses, sourceCapacity}, nil
 }
 
 // computeCronDesiredReplicas evaluates cron policies and returns the desired replicas
 // along with the applied cron policy statuses for status reporting.
 func (r *Reconciler) computeCronDesiredReplicas(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, specReplicas int32, now time.Time) (int32, string, []agentsv1alpha1.CronScalingPolicyStatus, error) {
 	targetReplicas, reason, appliedStatuses, err := evaluateCronPolicies(
-		pa.Spec.CronPolicies, now, pa.Status.AppliedCronPolicies,
+		ctx, pa.Spec.CronPolicies, now, pa.Status.AppliedCronPolicies,
 	)
 	if err != nil {
 		return specReplicas, "", nil, err
@@ -275,13 +310,16 @@ func cooldownExpired(lastScaleAt time.Time, windowSeconds int32, now time.Time) 
 	return now.Sub(lastScaleAt) >= time.Duration(windowSeconds)*time.Second
 }
 
-func (r *Reconciler) applyStabilizationWindow(pa *agentsv1alpha1.PoolAutoscaler, specReplicas, desiredReplicas int32) int32 {
+// applyStabilizationWindow checks whether the cooldown period has elapsed since
+// the last scale operation. It returns the replicas to apply, whether the scale
+// was blocked by the cooldown, and the remaining cooldown duration when blocked.
+func (r *Reconciler) applyStabilizationWindow(pa *agentsv1alpha1.PoolAutoscaler, specReplicas, desiredReplicas int32) (int32, bool, time.Duration) {
 	if desiredReplicas == specReplicas {
-		return desiredReplicas
+		return desiredReplicas, false, 0
 	}
 
 	key := types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}
-	monitor := r.getOrCreateMonitor(key)
+	monitor := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name)
 	now := time.Now()
 
 	monitor.mu.Lock()
@@ -293,34 +331,33 @@ func (r *Reconciler) applyStabilizationWindow(pa *agentsv1alpha1.PoolAutoscaler,
 		lastScaleAt = monitor.lastScaleDownAt
 	}
 
+	var windowSeconds int32
 	if desiredReplicas > specReplicas {
 		// Scale up — check cooldown since last ANY scale action
-		windowSeconds := int32(defaultScaleUpStabilization)
+		windowSeconds = int32(defaultScaleUpStabilization)
 		if pa.Spec.CapacityPolicy != nil && pa.Spec.CapacityPolicy.ScaleUp != nil &&
 			pa.Spec.CapacityPolicy.ScaleUp.StabilizationWindowSeconds != nil {
 			windowSeconds = *pa.Spec.CapacityPolicy.ScaleUp.StabilizationWindowSeconds
 		}
-		if cooldownExpired(lastScaleAt, windowSeconds, now) {
-			return desiredReplicas
+	} else {
+		// desiredReplicas < specReplicas — scale down, check cooldown since last ANY scale action
+		windowSeconds = int32(defaultScaleDownStabilization)
+		if pa.Spec.CapacityPolicy != nil && pa.Spec.CapacityPolicy.ScaleDown != nil &&
+			pa.Spec.CapacityPolicy.ScaleDown.StabilizationWindowSeconds != nil {
+			windowSeconds = *pa.Spec.CapacityPolicy.ScaleDown.StabilizationWindowSeconds
 		}
-		return specReplicas // in cooldown
 	}
 
-	// desiredReplicas < specReplicas — scale down, check cooldown since last ANY scale action
-	windowSeconds := int32(defaultScaleDownStabilization)
-	if pa.Spec.CapacityPolicy != nil && pa.Spec.CapacityPolicy.ScaleDown != nil &&
-		pa.Spec.CapacityPolicy.ScaleDown.StabilizationWindowSeconds != nil {
-		windowSeconds = *pa.Spec.CapacityPolicy.ScaleDown.StabilizationWindowSeconds
-	}
 	if cooldownExpired(lastScaleAt, windowSeconds, now) {
-		return desiredReplicas
+		return desiredReplicas, false, 0
 	}
-	return specReplicas // in cooldown
+	remaining := time.Duration(windowSeconds)*time.Second - now.Sub(lastScaleAt)
+	return specReplicas, true, remaining // in cooldown
 }
 
 // observeAndAggregate records a sample (if sampling interval has elapsed)
 // and returns the aggregated (averaged) available and statusReplicas values
-// from samples within the observation window.
+// from samples within the observation window, along with the sample count.
 //
 // When no samples exist yet (e.g., after controller restart), returns the
 // raw instantaneous values as fallback — equivalent to the behavior without
@@ -332,20 +369,20 @@ func (r *Reconciler) observeAndAggregate(
 	ctx context.Context,
 	pa *agentsv1alpha1.PoolAutoscaler,
 	rawAvailable, rawStatusReplicas int32,
-) (avgAvailable, avgReplicas int32) {
+) (avgAvailable, avgReplicas int32, sampleCount int) {
 	logger := klog.FromContext(ctx)
 
 	key := types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}
-	monitor := r.getOrCreateMonitor(key)
+	monitor := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name)
 	now := time.Now()
 
 	monitor.addSampleIfDue(rawAvailable, rawStatusReplicas, now)
 	monitor.pruneSamples(now)
 
-	avgAvail, avgStatus, sampleCount, ok := monitor.aggregatedValues()
+	avgAvail, avgStatus, count, ok := monitor.aggregatedValues()
 	if !ok {
 		// Warm-up fallback: no samples, use raw values
-		return rawAvailable, rawStatusReplicas
+		return rawAvailable, rawStatusReplicas, 0
 	}
 
 	logger.V(3).Info("Observation window aggregation",
@@ -353,19 +390,23 @@ func (r *Reconciler) observeAndAggregate(
 		"rawStatusReplicas", rawStatusReplicas,
 		"avgAvailable", avgAvail,
 		"avgReplicas", avgStatus,
-		"sampleCount", sampleCount,
+		"sampleCount", count,
 	)
-	return avgAvail, avgStatus
+	return avgAvail, avgStatus, count
 }
 
-// getOrCreateMonitor returns or creates the capacity monitor for the given key.
-func (r *Reconciler) getOrCreateMonitor(key types.NamespacedName) *capacityMonitor {
+// getOrCreateMonitorFor returns the capacity monitor bound to the given
+// PoolAutoscaler identity, creating it when absent. An existing monitor whose
+// UID or targetRef no longer matches (PA recreated or retargeted) is discarded
+// and replaced by a fresh one, so stale samples and cooldowns never leak
+// across object lifecycles.
+func (r *Reconciler) getOrCreateMonitorFor(key types.NamespacedName, uid types.UID, targetRef string) *capacityMonitor {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if m, ok := r.monitors[key]; ok {
+	if m, ok := r.monitors[key]; ok && m.paUID == uid && m.targetRef == targetRef {
 		return m
 	}
-	m := &capacityMonitor{}
+	m := &capacityMonitor{paUID: uid, targetRef: targetRef}
 	r.monitors[key] = m
 	return m
 }
@@ -399,7 +440,7 @@ func (r *Reconciler) recordScaleAction(key types.NamespacedName, scaleUp bool) {
 // NOT: ceil(base × targetPercent) - ceil(base × tolerancePercent),
 // which produces different results due to ceiling rounding.
 func computeWatermarks(targetVal intstr.IntOrString, toleranceVal *intstr.IntOrString, base int32) (target, lower, upper int32) {
-	toleranceWithDefault := defaultToleranceForType(targetVal, toleranceVal)
+	toleranceWithDefault := defaultToleranceForType(toleranceVal)
 
 	if targetVal.Type == intstr.String && toleranceWithDefault.Type == intstr.String {
 		// Both are percentages: combine before applying to base
@@ -423,16 +464,14 @@ func computeWatermarks(targetVal intstr.IntOrString, toleranceVal *intstr.IntOrS
 	return target, lower, upper
 }
 
-// defaultToleranceForType returns the configured tolerance, or a default that
-// matches the type of targetAvailable (percentage default for percentage target,
-// absolute default for absolute target).
-func defaultToleranceForType(targetVal intstr.IntOrString, tolerance *intstr.IntOrString) intstr.IntOrString {
+// defaultToleranceForType returns the configured tolerance, or the default 10%.
+func defaultToleranceForType(tolerance *intstr.IntOrString) intstr.IntOrString {
 	if tolerance != nil {
 		return *tolerance
 	}
 	// Default tolerance: 10% (as percentage) when target is percentage,
 	// otherwise resolve 10% of total as absolute (handled by caller).
-	return intstr.FromString(fmt.Sprintf("%d%%", defaultTolerancePercent))
+	return intstr.FromString("10%")
 }
 
 // parsePercentValue extracts the numeric portion from a percentage IntOrString (e.g., "70%" → 70).

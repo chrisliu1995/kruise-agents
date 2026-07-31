@@ -17,6 +17,7 @@ limitations under the License.
 package poolautoscaler
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -66,7 +67,7 @@ func TestEvaluateCronPolicies(t *testing.T) {
 				{Name: "scale-up", Schedule: "0 8 * * *", TargetReplicas: 100, TimeZone: &utc},
 				{Name: "scale-down", Schedule: "0 20 * * *", TargetReplicas: 20, TimeZone: &utc},
 			},
-			now:            time.Date(2026, 7, 3, 21, 0, 0, 0, time.UTC),
+			now: time.Date(2026, 7, 3, 21, 0, 0, 0, time.UTC),
 			existingStatus: []agentsv1alpha1.CronScalingPolicyStatus{
 				{Name: "scale-up", LastScheduleTime: timePtr(2026, 7, 3, 8, 0, 0)},
 				{Name: "scale-down", LastScheduleTime: timePtr(2026, 7, 2, 20, 0, 0)}, // yesterday
@@ -79,7 +80,7 @@ func TestEvaluateCronPolicies(t *testing.T) {
 			policies: []agentsv1alpha1.CronScalingPolicy{
 				{Name: "scale-up", Schedule: "0 8 * * *", TargetReplicas: 100, TimeZone: &utc},
 			},
-			now:            time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC),
+			now: time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC),
 			existingStatus: []agentsv1alpha1.CronScalingPolicyStatus{
 				{Name: "scale-up", LastScheduleTime: timePtr(2026, 7, 3, 8, 0, 0)}, // already applied
 			},
@@ -90,7 +91,7 @@ func TestEvaluateCronPolicies(t *testing.T) {
 			policies: []agentsv1alpha1.CronScalingPolicy{
 				{Name: "frequent", Schedule: "* * * * *", TargetReplicas: 5, TimeZone: &utc},
 			},
-			now:            time.Date(2026, 7, 3, 10, 30, 15, 0, time.UTC),
+			now: time.Date(2026, 7, 3, 10, 30, 15, 0, time.UTC),
 			existingStatus: []agentsv1alpha1.CronScalingPolicyStatus{
 				{Name: "frequent", LastScheduleTime: timePtr(2026, 7, 3, 10, 29, 0)},
 			},
@@ -102,7 +103,7 @@ func TestEvaluateCronPolicies(t *testing.T) {
 			policies: []agentsv1alpha1.CronScalingPolicy{
 				{Name: "morning", Schedule: "0 8 * * *", TargetReplicas: 50, TimeZone: strPtr("Asia/Shanghai")},
 			},
-			now:            time.Date(2026, 7, 3, 1, 0, 0, 0, time.UTC), // Beijing 9am
+			now: time.Date(2026, 7, 3, 1, 0, 0, 0, time.UTC), // Beijing 9am
 			existingStatus: []agentsv1alpha1.CronScalingPolicyStatus{
 				{Name: "morning", LastScheduleTime: timePtr(2026, 7, 2, 0, 0, 0)},
 			},
@@ -114,23 +115,23 @@ func TestEvaluateCronPolicies(t *testing.T) {
 			policies: []agentsv1alpha1.CronScalingPolicy{
 				{Name: "bad", Schedule: "NOT VALID", TargetReplicas: 10, TimeZone: &utc},
 			},
-			now:            time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC),
-			expectError:    "invalid cron expression",
+			now:         time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC),
+			expectError: "invalid cron expression",
 		},
 		{
 			name: "invalid timezone",
 			policies: []agentsv1alpha1.CronScalingPolicy{
 				{Name: "bad-tz", Schedule: "0 8 * * *", TargetReplicas: 10, TimeZone: strPtr("Invalid/Zone")},
 			},
-			now:            time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC),
-			expectError:    "invalid timezone",
+			now:         time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC),
+			expectError: "invalid timezone",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			target, reason, statuses, err := evaluateCronPolicies(
-				tt.policies, tt.now, tt.existingStatus,
+				context.Background(), tt.policies, tt.now, tt.existingStatus,
 			)
 
 			if tt.expectError != "" {
@@ -154,51 +155,81 @@ func TestEvaluateCronPolicies(t *testing.T) {
 }
 
 func TestFindTriggerSince(t *testing.T) {
-	schedule, err := cronParser.Parse("0 8 * * *")
-	require.NoError(t, err)
-
 	tests := []struct {
 		name     string
+		schedule string
 		since    time.Time
 		now      time.Time
 		hasMatch bool
 	}{
 		{
 			name:     "trigger within window",
+			schedule: "0 8 * * *",
 			since:    time.Date(2026, 7, 3, 7, 0, 0, 0, time.UTC),
 			now:      time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC),
 			hasMatch: true,
 		},
 		{
 			name:     "no trigger — both before schedule",
+			schedule: "0 8 * * *",
 			since:    time.Date(2026, 7, 3, 6, 0, 0, 0, time.UTC),
 			now:      time.Date(2026, 7, 3, 7, 0, 0, 0, time.UTC),
 			hasMatch: false,
 		},
 		{
 			name:     "no trigger — since is after the schedule",
+			schedule: "0 8 * * *",
 			since:    time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC),
 			now:      time.Date(2026, 7, 3, 10, 0, 0, 0, time.UTC),
 			hasMatch: false,
 		},
 		{
 			name:     "trigger exactly at since boundary — not included (since is exclusive)",
+			schedule: "0 8 * * *",
 			since:    time.Date(2026, 7, 3, 8, 0, 0, 0, time.UTC),
 			now:      time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC),
 			hasMatch: false,
+		},
+		{
+			name:     "never-firing schedule (Feb 31) — no unbounded scan",
+			schedule: "0 0 31 2 *",
+			since:    time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+			now:      time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC),
+			hasMatch: false,
+		},
+		{
+			name:     "very old baseline with high-frequency schedule — iteration cap",
+			schedule: "* * * * *",
+			since:    time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+			now:      time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC),
+			hasMatch: true, // scan stops at the cap and returns the last computed trigger
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := findTriggerSince(schedule, tt.since, tt.now)
+			schedule, err := cronParser.Parse(tt.schedule)
+			require.NoError(t, err)
+			result := findTriggerSince(context.Background(), schedule, tt.since, tt.now)
 			if tt.hasMatch {
 				assert.False(t, result.IsZero())
+				assert.False(t, result.After(tt.now), "trigger must not be in the future")
 			} else {
 				assert.True(t, result.IsZero())
 			}
 		})
 	}
+
+	t.Run("cancelled context stops the scan", func(t *testing.T) {
+		schedule, err := cronParser.Parse("* * * * *")
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		result := findTriggerSince(ctx, schedule,
+			time.Date(2026, 7, 3, 7, 0, 0, 0, time.UTC),
+			time.Date(2026, 7, 3, 9, 0, 0, 0, time.UTC))
+		assert.True(t, result.IsZero(), "cancelled context must abort before computing triggers")
+	})
 }
 
 func timePtr(year int, month time.Month, day, hour, min, sec int) *metav1.Time {

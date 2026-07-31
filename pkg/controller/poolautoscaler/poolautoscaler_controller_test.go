@@ -56,7 +56,7 @@ func newTestReconciler(objs ...client.Object) *Reconciler {
 		WithScheme(scheme).
 		WithObjects(objs...).
 		WithStatusSubresource(&agentsv1alpha1.PoolAutoscaler{}).
-		WithIndex(&agentsv1alpha1.PoolAutoscaler{}, "spec.scaleTargetRef.name", func(obj client.Object) []string {
+		WithIndex(&agentsv1alpha1.PoolAutoscaler{}, scaleTargetRefNameIndex, func(obj client.Object) []string {
 			pa := obj.(*agentsv1alpha1.PoolAutoscaler)
 			if pa.Spec.ScaleTargetRef.Name == "" {
 				return nil
@@ -120,6 +120,7 @@ func TestReconcile(t *testing.T) {
 	tests := []struct {
 		name              string
 		objs              []client.Object
+		setupMonitors     func(r *Reconciler)
 		req               ctrl.Request
 		expectError       string
 		expectSBSReplicas *int32
@@ -174,12 +175,12 @@ func TestReconcile(t *testing.T) {
 						TargetAvailable: intstr.FromInt32(10),
 						Tolerance:       intOrStrPtr(intstr.FromInt32(2)),
 					}),
-				newSandboxSet("test-sbs", "default", 10, 10, 5),
+				newSandboxSet("test-sbs", "default", 5, 5, 5),
 			},
 			req:               ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-pa", Namespace: "default"}},
 			expectError:       "",
-			expectSBSReplicas: int32Ptr(15),
-			expectDesired:     int32Ptr(15),
+			expectSBSReplicas: int32Ptr(10),
+			expectDesired:     int32Ptr(10),
 		},
 		{
 			name: "scale down - available above upper watermark",
@@ -190,6 +191,21 @@ func TestReconcile(t *testing.T) {
 						Tolerance:       intOrStrPtr(intstr.FromInt32(1)),
 					}),
 				newSandboxSet("test-sbs", "default", 10, 10, 9),
+			},
+			// Scale-down requires a fully populated observation window; pre-fill
+			// the monitor with a full window of samples matching the fixture.
+			setupMonitors: func(r *Reconciler) {
+				now := time.Now()
+				interval := time.Duration(samplingIntervalSeconds) * time.Second
+				monitor := &capacityMonitor{targetRef: "test-sbs", lastSampleAt: now}
+				for i := observationWindowSeconds / samplingIntervalSeconds; i > 0; i-- {
+					monitor.samples = append(monitor.samples, sample{
+						timestamp:      now.Add(-time.Duration(i-1) * interval),
+						available:      9,
+						statusReplicas: 10,
+					})
+				}
+				r.monitors[types.NamespacedName{Namespace: "default", Name: "test-pa"}] = monitor
 			},
 			req:               ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-pa", Namespace: "default"}},
 			expectError:       "",
@@ -216,6 +232,9 @@ func TestReconcile(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newTestReconciler(tt.objs...)
+			if tt.setupMonitors != nil {
+				tt.setupMonitors(r)
+			}
 			result, err := r.Reconcile(context.Background(), tt.req)
 
 			if tt.expectError == "" {
@@ -250,6 +269,112 @@ func TestReconcile(t *testing.T) {
 			if tt.expectError == "" && tt.expectSBSReplicas != nil {
 				assert.True(t, result.RequeueAfter > 0, "expected requeue for normal reconcile")
 			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Conflict detection tests
+// ---------------------------------------------------------------------------
+
+func TestReconcile_ConflictingAutoscaler(t *testing.T) {
+	newPAWithCreation := func(name string, created time.Time) *agentsv1alpha1.PoolAutoscaler {
+		pa := newPoolAutoscaler(name, "default", "test-sbs", 20,
+			&agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(10),
+				Tolerance:       intOrStrPtr(intstr.FromInt32(5)),
+			})
+		pa.CreationTimestamp = metav1.NewTime(created)
+		return pa
+	}
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name              string
+		objs              []client.Object
+		reconcileName     string
+		expectConflict    bool
+		expectWinnerInMsg string
+		expectSBSReplicas int32
+	}{
+		{
+			name: "newer PA loses to older PA",
+			objs: []client.Object{
+				newPAWithCreation("old-pa", base),
+				newPAWithCreation("new-pa", base.Add(time.Hour)),
+				newSandboxSet("test-sbs", "default", 10, 10, 10),
+			},
+			reconcileName:     "new-pa",
+			expectConflict:    true,
+			expectWinnerInMsg: "old-pa",
+			expectSBSReplicas: 10,
+		},
+		{
+			name: "older PA wins and keeps reconciling",
+			objs: []client.Object{
+				newPAWithCreation("old-pa", base),
+				newPAWithCreation("new-pa", base.Add(time.Hour)),
+				newSandboxSet("test-sbs", "default", 10, 10, 10),
+			},
+			reconcileName:     "old-pa",
+			expectConflict:    false,
+			expectSBSReplicas: 10,
+		},
+		{
+			name: "creation timestamp tie broken by name",
+			objs: []client.Object{
+				newPAWithCreation("a-pa", base),
+				newPAWithCreation("b-pa", base),
+				newSandboxSet("test-sbs", "default", 10, 10, 10),
+			},
+			reconcileName:     "b-pa",
+			expectConflict:    true,
+			expectWinnerInMsg: "a-pa",
+			expectSBSReplicas: 10,
+		},
+		{
+			name: "single PA has no conflict",
+			objs: []client.Object{
+				newPAWithCreation("solo-pa", base),
+				newSandboxSet("test-sbs", "default", 10, 10, 10),
+			},
+			reconcileName:     "solo-pa",
+			expectConflict:    false,
+			expectSBSReplicas: 10,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newTestReconciler(tt.objs...)
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: tt.reconcileName, Namespace: "default"}}
+			_, err := r.Reconcile(context.Background(), req)
+			require.NoError(t, err)
+
+			pa := &agentsv1alpha1.PoolAutoscaler{}
+			require.NoError(t, r.Get(context.Background(), req.NamespacedName, pa))
+
+			var scalingActive *metav1.Condition
+			for i := range pa.Status.Conditions {
+				if pa.Status.Conditions[i].Type == string(agentsv1alpha1.ScalingActive) {
+					scalingActive = &pa.Status.Conditions[i]
+				}
+			}
+
+			if tt.expectConflict {
+				require.NotNil(t, scalingActive, "conflict condition must be persisted to status")
+				assert.Equal(t, metav1.ConditionFalse, scalingActive.Status)
+				assert.Equal(t, "ConflictingAutoscaler", scalingActive.Reason)
+				assert.Contains(t, scalingActive.Message, tt.expectWinnerInMsg)
+			} else {
+				require.NotNil(t, scalingActive)
+				assert.NotEqual(t, "ConflictingAutoscaler", scalingActive.Reason)
+			}
+
+			// The losing PA must not have touched the SandboxSet.
+			sbs := &agentsv1alpha1.SandboxSet{}
+			require.NoError(t, r.Get(context.Background(), types.NamespacedName{Name: "test-sbs", Namespace: "default"}, sbs))
+			assert.Equal(t, tt.expectSBSReplicas, sbs.Spec.Replicas)
 		})
 	}
 }
@@ -334,7 +459,7 @@ func TestUpdateStatus(t *testing.T) {
 			pa := newPoolAutoscaler("test-pa", "default", "test-sbs", 20, nil)
 			r := newTestReconciler(pa)
 
-			err := r.updateStatus(context.Background(), pa, tt.currentReplicas, tt.desiredReplicas, tt.available, nil, tt.suspended, tt.scaled)
+			err := r.updateStatus(context.Background(), pa, tt.currentReplicas, tt.desiredReplicas, tt.available, nil, tt.suspended, tt.scaled, false, "")
 			require.NoError(t, err)
 
 			got := &agentsv1alpha1.PoolAutoscaler{}
@@ -364,41 +489,39 @@ func TestUpdateStatus(t *testing.T) {
 func TestSetConditions(t *testing.T) {
 	tests := []struct {
 		name                string
-		minReplicas         int32
-		maxReplicas         int32
 		desiredReplicas     int32
+		limited             bool
+		limitReason         string
 		expectLimitedStatus metav1.ConditionStatus
 		expectLimitedReason string
 	}{
 		{
 			name:                "desired within range",
-			minReplicas:         5,
-			maxReplicas:         20,
 			desiredReplicas:     10,
+			limited:             false,
 			expectLimitedStatus: metav1.ConditionFalse,
 			expectLimitedReason: "DesiredWithinRange",
 		},
 		{
-			name:                "desired at max",
-			minReplicas:         5,
-			maxReplicas:         20,
+			name:                "clamped to max",
 			desiredReplicas:     20,
+			limited:             true,
+			limitReason:         "TooManyReplicas",
 			expectLimitedStatus: metav1.ConditionTrue,
 			expectLimitedReason: "TooManyReplicas",
 		},
 		{
-			name:                "desired at min",
-			minReplicas:         5,
-			maxReplicas:         20,
+			name:                "clamped to min",
 			desiredReplicas:     5,
+			limited:             true,
+			limitReason:         "TooFewReplicas",
 			expectLimitedStatus: metav1.ConditionTrue,
 			expectLimitedReason: "TooFewReplicas",
 		},
 		{
-			name:                "desired at zero with nil min - not limited",
-			minReplicas:         0,
-			maxReplicas:         20,
+			name:                "desired equals bound but not limited",
 			desiredReplicas:     0,
+			limited:             false,
 			expectLimitedStatus: metav1.ConditionFalse,
 			expectLimitedReason: "DesiredWithinRange",
 		},
@@ -408,12 +531,13 @@ func TestSetConditions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r := &Reconciler{}
 			pa := &agentsv1alpha1.PoolAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Generation: 3},
 				Spec: agentsv1alpha1.PoolAutoscalerSpec{
-					MinReplicas: tt.minReplicas,
-					MaxReplicas: tt.maxReplicas,
+					MinReplicas: 5,
+					MaxReplicas: 20,
 				},
 			}
-			r.setConditions(pa, tt.desiredReplicas)
+			r.setConditions(pa, tt.desiredReplicas, tt.limited, tt.limitReason)
 
 			// Should have 3 conditions: ScalingActive, AbleToScale, and ScalingLimited
 			assert.Len(t, pa.Status.Conditions, 3)
@@ -436,6 +560,11 @@ func TestSetConditions(t *testing.T) {
 			require.NotNil(t, scalingLimited)
 			assert.Equal(t, tt.expectLimitedStatus, scalingLimited.Status)
 			assert.Equal(t, tt.expectLimitedReason, scalingLimited.Reason)
+
+			// All conditions must carry the observed generation
+			for _, c := range pa.Status.Conditions {
+				assert.Equal(t, pa.Generation, c.ObservedGeneration, "condition %s observedGeneration", c.Type)
+			}
 		})
 	}
 }

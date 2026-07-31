@@ -57,6 +57,11 @@ var (
 	controllerKind       = agentsv1alpha1.GroupVersion.WithKind("PoolAutoscaler")
 )
 
+// scaleTargetRefNameIndex is the field index on PoolAutoscaler objects keyed by
+// spec.scaleTargetRef.name. Registered in SetupWithManager and used by the
+// SandboxSet event handler and the conflict detection in Reconcile.
+const scaleTargetRefNameIndex = "spec.scaleTargetRef.name"
+
 // Add creates a new PoolAutoscaler Controller and adds it to the Manager.
 func Add(mgr manager.Manager) error {
 	if !utilfeature.DefaultFeatureGate.Enabled(features.PoolAutoscalerGate) || !discovery.DiscoverGVK(controllerKind) {
@@ -86,7 +91,7 @@ type Reconciler struct {
 func (r *Reconciler) SetupWithManager(mgr manager.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(),
 		&agentsv1alpha1.PoolAutoscaler{},
-		"spec.scaleTargetRef.name",
+		scaleTargetRefNameIndex,
 		func(obj client.Object) []string {
 			pa := obj.(*agentsv1alpha1.PoolAutoscaler)
 			if pa.Spec.ScaleTargetRef.Name == "" {
@@ -108,7 +113,9 @@ func (r *Reconciler) sandboxSetToPoolAutoscaler(ctx context.Context, obj client.
 	sbs := obj.(*agentsv1alpha1.SandboxSet)
 	paList := &agentsv1alpha1.PoolAutoscalerList{}
 	if err := r.List(ctx, paList, client.InNamespace(sbs.Namespace),
-		client.MatchingFields{"spec.scaleTargetRef.name": sbs.Name}); err != nil {
+		client.MatchingFields{scaleTargetRefNameIndex: sbs.Name}); err != nil {
+		klog.FromContext(ctx).Error(err, "Failed to list PoolAutoscalers for SandboxSet",
+			"sandboxset", klog.KObj(sbs))
 		return nil
 	}
 	var requests []ctrl.Request
@@ -136,16 +143,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
+	// Base copy for best-effort status patches on error paths.
+	paOriginal := pa.DeepCopy()
+
 	if pa.Spec.Suspend != nil && *pa.Spec.Suspend {
 		logger.V(5).Info("PoolAutoscaler is suspended, skipping reconciliation")
 		setCondition(pa, metav1.Condition{
 			Type:               string(agentsv1alpha1.ScalingActive),
 			Status:             metav1.ConditionFalse,
 			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: pa.Generation,
 			Reason:             "Suspended",
 			Message:            "autoscaler is suspended",
 		})
-		if err := r.updateStatus(ctx, pa, pa.Status.CurrentReplicas, pa.Status.DesiredReplicas, pa.Status.CurrentCapacity.Available, nil, true, false); err != nil {
+		if err := r.updateStatus(ctx, pa, pa.Status.CurrentReplicas, pa.Status.DesiredReplicas, pa.Status.CurrentCapacity.Available, nil, true, false, false, ""); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -158,6 +169,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			Type:               string(agentsv1alpha1.ScalingActive),
 			Status:             metav1.ConditionFalse,
 			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: pa.Generation,
 			Reason:             "FailedGetTarget",
 			Message:            fmt.Sprintf("failed to get SandboxSet: %v", err),
 		})
@@ -165,41 +177,75 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			Type:               string(agentsv1alpha1.AbleToScale),
 			Status:             metav1.ConditionFalse,
 			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: pa.Generation,
 			Reason:             "FailedGetTarget",
 			Message:            fmt.Sprintf("failed to get SandboxSet: %v", err),
 		})
 		r.recorder.Eventf(pa, "Warning", "FailedGetScale",
 			"Failed to get SandboxSet %s/%s: %v", pa.Namespace, pa.Spec.ScaleTargetRef.Name, err)
+		r.persistConditions(ctx, pa, paOriginal)
 		return ctrl.Result{}, err
+	}
+
+	// Conflict detection: only the oldest PoolAutoscaler targeting a SandboxSet
+	// may scale it. This complements the webhook, which cannot fully prevent
+	// races or objects created while the webhook was unavailable.
+	conflicting, winnerName, err := r.findConflictingAutoscaler(ctx, pa)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if conflicting {
+		logger.Info("Conflicting PoolAutoscaler detected, skipping scaling", "winner", winnerName)
+		setCondition(pa, metav1.Condition{
+			Type:               string(agentsv1alpha1.ScalingActive),
+			Status:             metav1.ConditionFalse,
+			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: pa.Generation,
+			Reason:             "ConflictingAutoscaler",
+			Message:            fmt.Sprintf("SandboxSet %q is already managed by older PoolAutoscaler %q", pa.Spec.ScaleTargetRef.Name, winnerName),
+		})
+		r.persistConditions(ctx, pa, paOriginal)
+		return ctrl.Result{}, nil
 	}
 
 	setCondition(pa, metav1.Condition{
 		Type:               string(agentsv1alpha1.AbleToScale),
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: pa.Generation,
 		Reason:             "ReadyToScale",
 		Message:            "the autoscaler can access the target resource",
 	})
 
 	specReplicas := sbs.Spec.Replicas
 	statusReplicas := sbs.Status.Replicas
-	available := sbs.Status.AvailableReplicas
+	statusAvailable := sbs.Status.AvailableReplicas
 
-	avgAvailable, avgReplicas := r.observeAndAggregate(ctx, pa, available, statusReplicas)
-	result, err := r.computeDesiredReplicas(ctx, pa, specReplicas, avgReplicas, avgAvailable)
+	avgAvailable, avgReplicas, sampleCount := r.observeAndAggregate(ctx, pa, statusAvailable, statusReplicas)
+	result, err := r.computeDesiredReplicas(ctx, pa, specReplicas, avgReplicas, avgAvailable, sampleCount)
 	if err != nil {
 		r.recorder.Eventf(pa, "Warning", "FailedComputeReplicas",
 			"Failed to compute desired replicas: %v", err)
 		return ctrl.Result{}, err
 	}
 
-	desiredReplicas := r.clampToBounds(pa, result.desiredReplicas)
+	desiredReplicas, limited, limitReason := r.clampToBounds(pa, result.desiredReplicas)
 	reason := result.reason
 
 	// Cron-triggered scaling bypasses the stabilization window — cron represents
 	// an explicit user intent for a specific replica count at a specific time.
-	if !result.cronTriggered {
-		desiredReplicas = r.applyStabilizationWindow(pa, specReplicas, desiredReplicas)
+	var cooldownRemaining time.Duration
+	if result.source != sourceCron {
+		var blocked bool
+		desiredReplicas, blocked, cooldownRemaining = r.applyStabilizationWindow(pa, specReplicas, desiredReplicas)
+		if blocked {
+			// The bound-limited value was discarded in favor of the current spec.
+			limited, limitReason = false, ""
+			reason = fmt.Sprintf("scaling blocked by stabilization window (cooldown remaining: %s)", cooldownRemaining.Round(time.Second))
+			r.recorder.Eventf(pa, "Normal", "ScaleBlocked",
+				"Scaling %s/%s blocked by stabilization window (cooldown remaining: %s)",
+				pa.Namespace, pa.Spec.ScaleTargetRef.Name, cooldownRemaining.Round(time.Second))
+		}
 	}
 
 	// Compare against spec (what we previously told SandboxSet), not status
@@ -209,12 +255,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				Type:               string(agentsv1alpha1.AbleToScale),
 				Status:             metav1.ConditionFalse,
 				LastTransitionTime: metav1.Now(),
+				ObservedGeneration: pa.Generation,
 				Reason:             "FailedScale",
 				Message:            fmt.Sprintf("failed to scale: %v", err),
 			})
 			r.recorder.Eventf(pa, "Warning", "FailedScale",
 				"Failed to scale %s/%s from %d to %d: %v",
 				pa.Namespace, pa.Spec.ScaleTargetRef.Name, specReplicas, desiredReplicas, err)
+			r.persistConditions(ctx, pa, paOriginal)
 			return ctrl.Result{}, err
 		}
 		action := "ScaledUp"
@@ -230,20 +278,65 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	scaled := (desiredReplicas != specReplicas)
-	if err := r.updateStatus(ctx, pa, statusReplicas, desiredReplicas, available, result.appliedCronPolicies, false, scaled); err != nil {
+	if err := r.updateStatus(ctx, pa, statusReplicas, desiredReplicas, statusAvailable, result.appliedCronPolicies, false, scaled, limited, limitReason); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Requeue aligned with last sample time so that observeAndAggregate
 	// collects a new sample on each reconcile pass.
 	key := types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}
-	monitor := r.getOrCreateMonitor(key)
+	monitor := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name)
 	nextDue := monitor.getLastSampleAt().Add(time.Duration(samplingIntervalSeconds) * time.Second)
 	requeueAfter := time.Until(nextDue)
 	if requeueAfter <= 0 {
 		requeueAfter = time.Duration(samplingIntervalSeconds) * time.Second
 	}
+	// When blocked by the stabilization window, wake up as soon as the cooldown
+	// expires if that happens before the next sampling slot.
+	if cooldownRemaining > 0 && cooldownRemaining < requeueAfter {
+		requeueAfter = cooldownRemaining
+	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// findConflictingAutoscaler checks whether another PoolAutoscaler in the same
+// namespace targets the same SandboxSet and has precedence over this one.
+// The oldest PoolAutoscaler wins (earliest CreationTimestamp, ties broken by
+// name ordering). Returns the winner's name when the given PA loses.
+func (r *Reconciler) findConflictingAutoscaler(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler) (bool, string, error) {
+	paList := &agentsv1alpha1.PoolAutoscalerList{}
+	if err := r.List(ctx, paList, client.InNamespace(pa.Namespace),
+		client.MatchingFields{scaleTargetRefNameIndex: pa.Spec.ScaleTargetRef.Name}); err != nil {
+		return false, "", err
+	}
+	if len(paList.Items) <= 1 {
+		return false, "", nil
+	}
+	winner := &paList.Items[0]
+	for i := 1; i < len(paList.Items); i++ {
+		candidate := &paList.Items[i]
+		if candidate.CreationTimestamp.Before(&winner.CreationTimestamp) ||
+			(candidate.CreationTimestamp.Equal(&winner.CreationTimestamp) && candidate.Name < winner.Name) {
+			winner = candidate
+		}
+	}
+	if winner.Name == pa.Name {
+		return false, "", nil
+	}
+	return true, winner.Name, nil
+}
+
+// persistConditions best-effort patches the status so that condition changes
+// on error paths remain visible on the object. Failures are logged and never
+// override the primary error.
+func (r *Reconciler) persistConditions(ctx context.Context, pa, paOriginal *agentsv1alpha1.PoolAutoscaler) {
+	if reflect.DeepEqual(pa.Status, paOriginal.Status) {
+		return
+	}
+	if err := r.Status().Patch(ctx, pa, client.MergeFrom(paOriginal)); err != nil {
+		klog.FromContext(ctx).Error(err, "Failed to persist PoolAutoscaler status conditions",
+			"poolautoscaler", klog.KObj(pa))
+	}
 }
 
 // getSandboxSet fetches the target SandboxSet.
@@ -259,15 +352,17 @@ func (r *Reconciler) getSandboxSet(ctx context.Context, pa *agentsv1alpha1.PoolA
 	return sbs, nil
 }
 
-// clampToBounds enforces minReplicas and maxReplicas constraints.
-func (r *Reconciler) clampToBounds(pa *agentsv1alpha1.PoolAutoscaler, desired int32) int32 {
+// clampToBounds enforces minReplicas and maxReplicas constraints. It reports
+// whether the desired value was limited by a bound and which bound applied
+// ("TooFewReplicas" for the minimum, "TooManyReplicas" for the maximum).
+func (r *Reconciler) clampToBounds(pa *agentsv1alpha1.PoolAutoscaler, desired int32) (int32, bool, string) {
 	if desired < pa.Spec.MinReplicas {
-		desired = pa.Spec.MinReplicas
+		return pa.Spec.MinReplicas, true, "TooFewReplicas"
 	}
 	if desired > pa.Spec.MaxReplicas {
-		desired = pa.Spec.MaxReplicas
+		return pa.Spec.MaxReplicas, true, "TooManyReplicas"
 	}
-	return desired
+	return desired, false, ""
 }
 
 // doScale patches the SandboxSet spec.replicas.
@@ -278,15 +373,20 @@ func (r *Reconciler) doScale(ctx context.Context, sbs *agentsv1alpha1.SandboxSet
 }
 
 // updateStatus updates the PoolAutoscaler status fields.
-func (r *Reconciler) updateStatus(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, currentReplicas, desiredReplicas, available int32, appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus, suspended bool, scaled bool) error {
+func (r *Reconciler) updateStatus(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, currentReplicas, desiredReplicas, available int32, appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus, suspended bool, scaled bool, limited bool, limitReason string) error {
 	paCopy := pa.DeepCopy()
 	pa.Status.ObservedGeneration = &pa.Generation
 	pa.Status.CurrentReplicas = currentReplicas
 	pa.Status.DesiredReplicas = desiredReplicas
 	pa.Status.Suspended = suspended
 	pa.Status.CurrentCapacity = agentsv1alpha1.CapacityStatus{Available: available}
-	if appliedCronPolicies != nil {
+	// Replace AppliedCronPolicies unconditionally when cron policies are
+	// configured (an empty list clears stale entries); clear it entirely when
+	// the spec no longer has cron policies.
+	if len(pa.Spec.CronPolicies) > 0 {
 		pa.Status.AppliedCronPolicies = appliedCronPolicies
+	} else {
+		pa.Status.AppliedCronPolicies = nil
 	}
 
 	if scaled {
@@ -294,7 +394,7 @@ func (r *Reconciler) updateStatus(ctx context.Context, pa *agentsv1alpha1.PoolAu
 		pa.Status.LastScaleTime = &now
 	}
 
-	r.setConditions(pa, desiredReplicas)
+	r.setConditions(pa, desiredReplicas, limited, limitReason)
 
 	if reflect.DeepEqual(pa.Status, paCopy.Status) {
 		return nil
@@ -305,13 +405,14 @@ func (r *Reconciler) updateStatus(ctx context.Context, pa *agentsv1alpha1.PoolAu
 }
 
 // setConditions updates the conditions on the PoolAutoscaler.
-func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredReplicas int32) {
+func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredReplicas int32, limited bool, limitReason string) {
 	now := metav1.Now()
 
 	setCondition(pa, metav1.Condition{
 		Type:               string(agentsv1alpha1.ScalingActive),
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: now,
+		ObservedGeneration: pa.Generation,
 		Reason:             "ValidPolicy",
 		Message:            "the autoscaler is able to scale",
 	})
@@ -320,32 +421,30 @@ func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredRep
 		Type:               string(agentsv1alpha1.AbleToScale),
 		Status:             metav1.ConditionTrue,
 		LastTransitionTime: now,
+		ObservedGeneration: pa.Generation,
 		Reason:             "ReadyToScale",
 		Message:            "the autoscaler can access the target resource",
 	})
 
-	minReplicas := pa.Spec.MinReplicas
-	if desiredReplicas == pa.Spec.MaxReplicas {
+	if limited {
+		bound := "maximum"
+		if limitReason == "TooFewReplicas" {
+			bound = "minimum"
+		}
 		setCondition(pa, metav1.Condition{
 			Type:               string(agentsv1alpha1.ScalingLimited),
 			Status:             metav1.ConditionTrue,
 			LastTransitionTime: now,
-			Reason:             "TooManyReplicas",
-			Message:            fmt.Sprintf("the desired replica count is limited to the maximum %d", desiredReplicas),
-		})
-	} else if desiredReplicas == minReplicas && minReplicas > 0 {
-		setCondition(pa, metav1.Condition{
-			Type:               string(agentsv1alpha1.ScalingLimited),
-			Status:             metav1.ConditionTrue,
-			LastTransitionTime: now,
-			Reason:             "TooFewReplicas",
-			Message:            fmt.Sprintf("the desired replica count is limited to the minimum %d", desiredReplicas),
+			ObservedGeneration: pa.Generation,
+			Reason:             limitReason,
+			Message:            fmt.Sprintf("the desired replica count is limited to the %s %d", bound, desiredReplicas),
 		})
 	} else {
 		setCondition(pa, metav1.Condition{
 			Type:               string(agentsv1alpha1.ScalingLimited),
 			Status:             metav1.ConditionFalse,
 			LastTransitionTime: now,
+			ObservedGeneration: pa.Generation,
 			Reason:             "DesiredWithinRange",
 			Message:            "the desired count is within the acceptable range",
 		})
@@ -362,6 +461,7 @@ func setCondition(pa *agentsv1alpha1.PoolAutoscaler, condition metav1.Condition)
 				// Status unchanged but reason/message differs — update without bumping LastTransitionTime
 				pa.Status.Conditions[i].Reason = condition.Reason
 				pa.Status.Conditions[i].Message = condition.Message
+				pa.Status.Conditions[i].ObservedGeneration = condition.ObservedGeneration
 			}
 			return
 		}

@@ -17,6 +17,7 @@ limitations under the License.
 package poolautoscaler
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -30,6 +31,11 @@ var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month 
 
 // ReasonNoCronTriggered is the reason returned when no cron policy has triggered.
 const ReasonNoCronTriggered = "no cron policy has triggered yet"
+
+// maxCronScanIterations caps the number of schedule evaluations in
+// findTriggerSince, preventing an unbounded scan when a very old baseline
+// is combined with a high-frequency schedule.
+const maxCronScanIterations = 1000
 
 // cronPolicyResult holds the evaluation result of a single cron policy.
 type cronPolicyResult struct {
@@ -49,6 +55,7 @@ type cronPolicyResult struct {
 // policy (no status yet), the PoolAutoscaler's creationTimestamp is used as baseline,
 // so past schedules before creation are ignored.
 func evaluateCronPolicies(
+	ctx context.Context,
 	policies []agentsv1alpha1.CronScalingPolicy,
 	now time.Time,
 	existingStatus []agentsv1alpha1.CronScalingPolicyStatus,
@@ -83,32 +90,38 @@ func evaluateCronPolicies(
 		// Cron has minute-level granularity, so subtracting 1 minute ensures the
 		// current minute's trigger is captured on the first reconcile, while still
 		// preventing retroactive triggers from hours/days ago.
+		// NOTE: the synthetic 'now - 1 minute' baseline is only used as the starting
+		// point for findTriggerSince below — it is never written to status. Only real
+		// trigger times (or the previously recorded lastScheduleTime) end up in
+		// status.LastScheduleTime.
+		lastScheduleTime := findExistingScheduleTime(policy.Name, existingStatus)
 		baseline := now.Add(-time.Minute)
-		if existing := findExistingScheduleTime(policy.Name, existingStatus); existing != nil {
-			baseline = existing.Time
+		if lastScheduleTime != nil {
+			baseline = lastScheduleTime.Time
 		}
 
 		nowInTZ := now.In(loc)
-		newTrigger := findTriggerSince(schedule, baseline.In(loc), nowInTZ)
+		lastTriggerTime := findTriggerSince(ctx, schedule, baseline.In(loc), nowInTZ)
 
 		status := agentsv1alpha1.CronScalingPolicyStatus{Name: policy.Name}
-		if !newTrigger.IsZero() {
-			t := metav1.NewTime(newTrigger)
+		if !lastTriggerTime.IsZero() {
+			t := metav1.NewTime(lastTriggerTime)
 			status.LastScheduleTime = &t
 		} else {
-			status.LastScheduleTime = findExistingScheduleTime(policy.Name, existingStatus)
+			// No new trigger: keep only the previously recorded schedule time.
+			status.LastScheduleTime = lastScheduleTime
 		}
 		appliedStatuses = append(appliedStatuses, status)
 
-		if newTrigger.IsZero() {
+		if lastTriggerTime.IsZero() {
 			continue
 		}
 
-		if mostRecent == nil || newTrigger.After(mostRecent.triggerTime) {
+		if mostRecent == nil || lastTriggerTime.After(mostRecent.triggerTime) {
 			mostRecent = &cronPolicyResult{
 				name:           policy.Name,
 				targetReplicas: policy.TargetReplicas,
-				triggerTime:    newTrigger,
+				triggerTime:    lastTriggerTime,
 			}
 		}
 	}
@@ -123,12 +136,23 @@ func evaluateCronPolicies(
 
 // findTriggerSince finds the most recent time the schedule fired in the window (since, now].
 // Returns zero time if no trigger occurred in that window.
-func findTriggerSince(schedule cron.Schedule, since, now time.Time) time.Time {
+//
+// Defensive limits:
+//   - A zero 'next' from the schedule means it can never fire (e.g. Feb 31) — stop.
+//   - The scan is capped at maxCronScanIterations; when the cap is hit, the most
+//     recent trigger found so far is returned (still a valid trigger in the window).
+//   - The context is checked each iteration so cancellation exits promptly.
+func findTriggerSince(ctx context.Context, schedule cron.Schedule, since, now time.Time) time.Time {
 	var lastTrigger time.Time
 	candidate := since
-	for {
+	for i := 0; i < maxCronScanIterations; i++ {
+		select {
+		case <-ctx.Done():
+			return lastTrigger
+		default:
+		}
 		next := schedule.Next(candidate)
-		if next.After(now) {
+		if next.IsZero() || next.After(now) {
 			break
 		}
 		lastTrigger = next

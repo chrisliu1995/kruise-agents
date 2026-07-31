@@ -72,11 +72,15 @@ spec:
                     properties:
                       stabilizationWindowSeconds:
                         description: |-
-                          StabilizationWindowSeconds is the number of seconds for which past recommendations should be
-                          considered while scaling up or scaling down.
+                          StabilizationWindowSeconds is the cooldown period after any scale action before
+                          a scale in this direction is allowed. This is a cooldown model: the first scale
+                          action is immediate, subsequent actions must wait for the window to elapse since
+                          the most recent scale action (in either direction).
                           Must be >= 0 and <= 3600 (one hour).
                           Defaults: scale up: 0, scale down: 300.
                         format: int32
+                        maximum: 3600
+                        minimum: 0
                         type: integer
                     type: object
                   scaleUp:
@@ -84,11 +88,15 @@ spec:
                     properties:
                       stabilizationWindowSeconds:
                         description: |-
-                          StabilizationWindowSeconds is the number of seconds for which past recommendations should be
-                          considered while scaling up or scaling down.
+                          StabilizationWindowSeconds is the cooldown period after any scale action before
+                          a scale in this direction is allowed. This is a cooldown model: the first scale
+                          action is immediate, subsequent actions must wait for the window to elapse since
+                          the most recent scale action (in either direction).
                           Must be >= 0 and <= 3600 (one hour).
                           Defaults: scale up: 0, scale down: 300.
                         format: int32
+                        maximum: 3600
+                        minimum: 0
                         type: integer
                     type: object
                   targetAvailable:
@@ -113,8 +121,9 @@ spec:
                 - targetAvailable
                 type: object
               cronPolicies:
-                description: CronPolicies is a list of potential cron scaling policies
-                  which can be used during scaling.
+                description: |-
+                  CronPolicies is a list of potential cron scaling policies which can be used during scaling.
+                  When both CronPolicies and CapacityPolicy are set, CronPolicies takes higher priority.
                 items:
                   description: CronScalingPolicy defines the cron-based scaling configuration
                     for the resource pool.
@@ -131,6 +140,7 @@ spec:
                       description: TargetReplicas is the desired replicas when this
                         policy executes.
                       format: int32
+                      minimum: 0
                       type: integer
                     timeZone:
                       description: |-
@@ -148,12 +158,14 @@ spec:
                   MaxReplicas is the upper limit for the number of replicas to which the autoscaler can scale up.
                   It cannot be less than minReplicas.
                 format: int32
+                minimum: 1
                 type: integer
               minReplicas:
                 description: |-
                   MinReplicas is the lower limit for the number of replicas to which the autoscaler
                   can scale down. It defaults to 0 pods.
                 format: int32
+                minimum: 0
                 type: integer
               scaleTargetRef:
                 description: |-
@@ -164,7 +176,9 @@ spec:
                     description: API version of the referent
                     type: string
                   kind:
-                    description: 'Kind of the referent; More info: https://git.k8s.io/community/contributors/dede/sig-architecture/api-conventions.md#types-kinds'
+                    description: 'Kind of the referent; More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+                    enum:
+                    - SandboxSet
                     type: string
                   name:
                     description: 'Name of the referent; More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names'
@@ -182,6 +196,9 @@ spec:
             - maxReplicas
             - scaleTargetRef
             type: object
+            x-kubernetes-validations:
+            - message: minReplicas must not be greater than maxReplicas
+              rule: self.minReplicas <= self.maxReplicas
           status:
             description: Status is the current information about the autoscaler.
             properties:
@@ -261,6 +278,9 @@ spec:
                   - type
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               currentCapacity:
                 description: CurrentCapacity is the last read state of the capacity
                   used by this autoscaler.
