@@ -480,6 +480,75 @@ func TestComputeWatermarks(t *testing.T) {
 			expectedLower:   6, // ceil(10*0.6) = 6
 			expectedUpper:   8, // ceil(10*0.8) = 8
 		},
+		{
+			name:            "absolute target with default percentage tolerance",
+			targetAvailable: intstr.FromInt32(5),
+			tolerance:       nil,
+			base:            100,
+			expectedTarget:  5,
+			expectedLower:   4, // tol = ceil(5*10%) = 1
+			expectedUpper:   6,
+		},
+		{
+			name:            "absolute target with explicit percentage tolerance",
+			targetAvailable: intstr.FromInt32(5),
+			tolerance: func() *intstr.IntOrString {
+				v := intstr.FromString("10%")
+				return &v
+			}(),
+			base:           100,
+			expectedTarget: 5,
+			expectedLower:  4, // tol = ceil(5*10%) = 1, anchored to target not pool
+			expectedUpper:  6,
+		},
+		{
+			name:            "absolute target with large percentage tolerance still keeps scale-up reachable",
+			targetAvailable: intstr.FromInt32(5),
+			tolerance: func() *intstr.IntOrString {
+				v := intstr.FromString("50%")
+				return &v
+			}(),
+			base:           100,
+			expectedTarget: 5,
+			expectedLower:  2, // tol = ceil(5*50%) = 3; must stay > 0 so scale-up can fire
+			expectedUpper:  8,
+		},
+		{
+			name:            "absolute target with absolute tolerance",
+			targetAvailable: intstr.FromInt32(10),
+			tolerance: func() *intstr.IntOrString {
+				v := intstr.FromInt32(3)
+				return &v
+			}(),
+			base:           100,
+			expectedTarget: 10,
+			expectedLower:  7,
+			expectedUpper:  13,
+		},
+		{
+			name:            "percentage target with absolute tolerance",
+			targetAvailable: intstr.FromString("70%"),
+			tolerance: func() *intstr.IntOrString {
+				v := intstr.FromInt32(5)
+				return &v
+			}(),
+			base:           100,
+			expectedTarget: 70,
+			expectedLower:  65,
+			expectedUpper:  75,
+		},
+		{
+			name:            "small absolute target with percentage tolerance keeps tol >= 1",
+			targetAvailable: intstr.FromInt32(1),
+			tolerance: func() *intstr.IntOrString {
+				v := intstr.FromString("10%")
+				return &v
+			}(),
+			base:           100,
+			expectedTarget: 1,
+			expectedLower:  0, // tol = ceil(1*10%) = 1, lower clamped to 0
+			expectedUpper:  2,
+		},
 	}
 
 	for _, tt := range tests {

@@ -62,11 +62,30 @@ var (
 // SandboxSet event handler and the conflict detection in Reconcile.
 const scaleTargetRefNameIndex = "spec.scaleTargetRef.name"
 
+// validateObservationParameters guards the observation window flags against
+// values that would break the controller: a zero sampling interval causes an
+// integer divide-by-zero panic and a zero requeueAfter busy loop; a negative
+// window or a window smaller than the interval silently breaks the scale-down
+// warm-up guard. Invalid values fall back to the defaults instead of returning
+// an error, because Add runs in the shared controller-manager process and an
+// error here would take down all other controllers.
+func validateObservationParameters() {
+	if samplingIntervalSeconds <= 0 || observationWindowSeconds <= 0 || observationWindowSeconds < samplingIntervalSeconds {
+		klog.Warningf("Invalid PoolAutoscaler observation parameters (observation-window-seconds=%d, sampling-interval-seconds=%d); "+
+			"falling back to defaults (observation-window-seconds=%d, sampling-interval-seconds=%d)",
+			observationWindowSeconds, samplingIntervalSeconds,
+			defaultObservationWindowSeconds, defaultSamplingIntervalSeconds)
+		observationWindowSeconds = defaultObservationWindowSeconds
+		samplingIntervalSeconds = defaultSamplingIntervalSeconds
+	}
+}
+
 // Add creates a new PoolAutoscaler Controller and adds it to the Manager.
 func Add(mgr manager.Manager) error {
 	if !utilfeature.DefaultFeatureGate.Enabled(features.PoolAutoscalerGate) || !discovery.DiscoverGVK(controllerKind) {
 		return nil
 	}
+	validateObservationParameters()
 	r := &Reconciler{
 		Client:   mgr.GetClient(),
 		recorder: mgr.GetEventRecorderFor("pool-autoscaler-controller"),
@@ -129,7 +148,7 @@ func (r *Reconciler) sandboxSetToPoolAutoscaler(ctx context.Context, obj client.
 
 // +kubebuilder:rbac:groups=agents.kruise.io,resources=poolautoscalers,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agents.kruise.io,resources=poolautoscalers/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=agents.kruise.io,resources=sandboxsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=agents.kruise.io,resources=sandboxsets,verbs=get;list;watch;update;patch
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := klog.FromContext(ctx).WithValues("poolautoscaler", req.NamespacedName)

@@ -105,6 +105,11 @@ type CapacityPolicy struct {
 	// no updates are made to the desired number of replicas.
 	// Can be an absolute number (ex: 5) or a percentage (ex: 10%).
 	// If not set, defaults to 10%.
+	// A percentage tolerance is always resolved against the target value:
+	// when targetAvailable is also a percentage, both percentages are combined
+	// first and applied to the pool size; when targetAvailable is an absolute
+	// number, the percentage tolerance is applied to that resolved target
+	// (e.g. targetAvailable=5 with tolerance=10% yields watermarks [4, 6]).
 	// +optional
 	Tolerance *intstr.IntOrString `json:"tolerance,omitempty"`
 

@@ -830,3 +830,71 @@ func TestAdd(t *testing.T) {
 		assert.NoError(t, err)
 	})
 }
+
+func TestValidateObservationParameters(t *testing.T) {
+	tests := []struct {
+		name           string
+		window         int
+		interval       int
+		expectedWindow int
+		expectedInt    int
+	}{
+		{
+			name:           "valid parameters unchanged",
+			window:         60,
+			interval:       15,
+			expectedWindow: 60,
+			expectedInt:    15,
+		},
+		{
+			name:           "zero interval falls back to defaults",
+			window:         15,
+			interval:       0,
+			expectedWindow: defaultObservationWindowSeconds,
+			expectedInt:    defaultSamplingIntervalSeconds,
+		},
+		{
+			name:           "negative interval falls back to defaults",
+			window:         15,
+			interval:       -5,
+			expectedWindow: defaultObservationWindowSeconds,
+			expectedInt:    defaultSamplingIntervalSeconds,
+		},
+		{
+			name:           "zero window falls back to defaults",
+			window:         0,
+			interval:       5,
+			expectedWindow: defaultObservationWindowSeconds,
+			expectedInt:    defaultSamplingIntervalSeconds,
+		},
+		{
+			name:           "negative window falls back to defaults",
+			window:         -15,
+			interval:       5,
+			expectedWindow: defaultObservationWindowSeconds,
+			expectedInt:    defaultSamplingIntervalSeconds,
+		},
+		{
+			name:           "window smaller than interval falls back to defaults",
+			window:         10,
+			interval:       15,
+			expectedWindow: defaultObservationWindowSeconds,
+			expectedInt:    defaultSamplingIntervalSeconds,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origWindow, origInterval := observationWindowSeconds, samplingIntervalSeconds
+			defer func() {
+				observationWindowSeconds, samplingIntervalSeconds = origWindow, origInterval
+			}()
+			observationWindowSeconds, samplingIntervalSeconds = tt.window, tt.interval
+
+			validateObservationParameters()
+
+			assert.Equal(t, tt.expectedWindow, observationWindowSeconds, "window mismatch")
+			assert.Equal(t, tt.expectedInt, samplingIntervalSeconds, "interval mismatch")
+		})
+	}
+}

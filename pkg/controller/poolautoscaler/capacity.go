@@ -45,9 +45,14 @@ const (
 
 // Observation window parameters — set once via command-line flags at startup
 // and read-only afterwards. NOT safe for concurrent modification at runtime.
+const (
+	defaultObservationWindowSeconds = 15
+	defaultSamplingIntervalSeconds  = 5
+)
+
 var (
-	observationWindowSeconds = 15
-	samplingIntervalSeconds  = 5
+	observationWindowSeconds = defaultObservationWindowSeconds
+	samplingIntervalSeconds  = defaultSamplingIntervalSeconds
 )
 
 // sample records a single observation of available and status replicas.
@@ -451,9 +456,18 @@ func computeWatermarks(targetVal intstr.IntOrString, toleranceVal *intstr.IntOrS
 		lower = int32(math.Ceil(float64(base) * (targetPct - tolerancePct) / 100.0))
 		upper = int32(math.Ceil(float64(base) * (targetPct + tolerancePct) / 100.0))
 	} else {
-		// Absolute values (or mixed): resolve independently then combine
+		// Mixed or absolute configs: resolve the target against the pool size first,
+		// then resolve tolerance against the resolved target. Anchoring a
+		// percentage tolerance to the pool size would widen the dead zone as the
+		// pool grows and — when tolerance exceeds target — clamp the lower
+		// watermark to 0, making the scale-up condition unreachable.
 		target = resolveIntOrPercent(targetVal, base)
-		tol := resolveIntOrPercent(toleranceWithDefault, base)
+		var tol int32
+		if toleranceWithDefault.Type == intstr.String {
+			tol = int32(math.Ceil(float64(target) * parsePercentValue(toleranceWithDefault) / 100.0))
+		} else {
+			tol = toleranceWithDefault.IntVal
+		}
 		lower = target - tol
 		upper = target + tol
 	}
