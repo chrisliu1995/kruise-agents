@@ -126,6 +126,9 @@ func TestReconcile(t *testing.T) {
 		expectSBSReplicas *int32
 		expectDesired     *int32
 		expectSuspended   *bool
+		// expectScalingActiveReason, when non-empty, asserts that the
+		// ScalingActive condition is False with this reason.
+		expectScalingActiveReason string
 	}{
 		{
 			name:        "PoolAutoscaler not found - returns nil",
@@ -154,6 +157,9 @@ func TestReconcile(t *testing.T) {
 			req:             ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-pa", Namespace: "default"}},
 			expectError:     "",
 			expectSuspended: boolPtr(true),
+			// The Suspended condition must survive updateStatus: it must not
+			// be overwritten by the generic ScalingActive=True/ValidPolicy.
+			expectScalingActiveReason: "Suspended",
 		},
 		{
 			name: "SandboxSet not found - returns error",
@@ -253,7 +259,7 @@ func TestReconcile(t *testing.T) {
 			}
 
 			// Check PA status if expected
-			if tt.expectDesired != nil || tt.expectSuspended != nil {
+			if tt.expectDesired != nil || tt.expectSuspended != nil || tt.expectScalingActiveReason != "" {
 				pa := &agentsv1alpha1.PoolAutoscaler{}
 				err := r.Get(context.Background(), tt.req.NamespacedName, pa)
 				require.NoError(t, err)
@@ -262,6 +268,17 @@ func TestReconcile(t *testing.T) {
 				}
 				if tt.expectSuspended != nil {
 					assert.Equal(t, *tt.expectSuspended, pa.Status.Suspended, "Suspended mismatch")
+				}
+				if tt.expectScalingActiveReason != "" {
+					var scalingActive *metav1.Condition
+					for i := range pa.Status.Conditions {
+						if pa.Status.Conditions[i].Type == string(agentsv1alpha1.ScalingActive) {
+							scalingActive = &pa.Status.Conditions[i]
+						}
+					}
+					require.NotNil(t, scalingActive, "ScalingActive condition must be persisted")
+					assert.Equal(t, metav1.ConditionFalse, scalingActive.Status, "ScalingActive must remain False")
+					assert.Equal(t, tt.expectScalingActiveReason, scalingActive.Reason, "ScalingActive reason mismatch")
 				}
 			}
 
@@ -348,8 +365,16 @@ func TestReconcile_ConflictingAutoscaler(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newTestReconciler(tt.objs...)
 			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: tt.reconcileName, Namespace: "default"}}
-			_, err := r.Reconcile(context.Background(), req)
+			result, err := r.Reconcile(context.Background(), req)
 			require.NoError(t, err)
+
+			// The losing PA must requeue periodically so it can take over once
+			// the winner disappears; the winner reconciles at sampling cadence.
+			if tt.expectConflict {
+				assert.Equal(t, conflictRequeueInterval, result.RequeueAfter, "conflict loser must requeue")
+			} else {
+				assert.NotEqual(t, conflictRequeueInterval, result.RequeueAfter, "winner must not use the conflict requeue interval")
+			}
 
 			pa := &agentsv1alpha1.PoolAutoscaler{}
 			require.NoError(t, r.Get(context.Background(), req.NamespacedName, pa))
@@ -458,8 +483,9 @@ func TestUpdateStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			pa := newPoolAutoscaler("test-pa", "default", "test-sbs", 20, nil)
 			r := newTestReconciler(pa)
+			paOriginal := pa.DeepCopy()
 
-			err := r.updateStatus(context.Background(), pa, tt.currentReplicas, tt.desiredReplicas, tt.available, nil, tt.suspended, tt.scaled, false, "")
+			err := r.updateStatus(context.Background(), pa, paOriginal, tt.currentReplicas, tt.desiredReplicas, tt.available, nil, tt.suspended, tt.scaled, false, "")
 			require.NoError(t, err)
 
 			got := &agentsv1alpha1.PoolAutoscaler{}
@@ -476,8 +502,14 @@ func TestUpdateStatus(t *testing.T) {
 				assert.Nil(t, got.Status.LastScaleTime)
 			}
 
-			// Should have conditions set
-			assert.NotEmpty(t, got.Status.Conditions)
+			if tt.suspended {
+				// updateStatus must not set the generic conditions while
+				// suspended; the caller-provided conditions stand as-is.
+				assert.Empty(t, got.Status.Conditions, "conditions must not be overwritten while suspended")
+			} else {
+				// Should have conditions set
+				assert.NotEmpty(t, got.Status.Conditions)
+			}
 		})
 	}
 }

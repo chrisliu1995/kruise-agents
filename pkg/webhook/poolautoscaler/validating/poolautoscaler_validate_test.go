@@ -135,6 +135,9 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 				},
 				MaxReplicas: 10,
 				MinReplicas: 10,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(10),
+				},
 			},
 			expectError: "",
 		},
@@ -233,7 +236,7 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 			expectError: "must be >= 0 and <= 3600",
 		},
 		{
-			name: "bounds only is valid",
+			name: "bounds only without any policy - invalid",
 			spec: agentsv1alpha1.PoolAutoscalerSpec{
 				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
 					Kind: "SandboxSet",
@@ -241,6 +244,164 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 				},
 				MaxReplicas: 50,
 				MinReplicas: 5,
+			},
+			expectError: "at least one scaling policy",
+		},
+		{
+			name: "no capacity policy and no cron policies - invalid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+			},
+			expectError: "at least one scaling policy",
+		},
+		{
+			name: "absolute targetAvailable greater than maxReplicas",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 10,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(20),
+				},
+			},
+			expectError: "must not be greater than maxReplicas",
+		},
+		{
+			name: "absolute targetAvailable equal to maxReplicas - valid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 10,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(10),
+				},
+			},
+			expectError: "",
+		},
+		{
+			name: "percentage targetAvailable above maxReplicas is not statically rejected",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 10,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("70%"),
+				},
+			},
+			expectError: "",
+		},
+		{
+			name: "percentage tolerance equal to percentage target - invalid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("70%"),
+					Tolerance:       intOrStrPtr(intstr.FromString("70%")),
+				},
+			},
+			expectError: "must be less than targetAvailable",
+		},
+		{
+			name: "percentage tolerance greater than percentage target - invalid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("30%"),
+					Tolerance:       intOrStrPtr(intstr.FromString("50%")),
+				},
+			},
+			expectError: "must be less than targetAvailable",
+		},
+		{
+			name: "absolute tolerance equal to absolute target - invalid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(10),
+					Tolerance:       intOrStrPtr(intstr.FromInt32(10)),
+				},
+			},
+			expectError: "must be less than targetAvailable",
+		},
+		{
+			name: "absolute tolerance greater than absolute target - invalid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(5),
+					Tolerance:       intOrStrPtr(intstr.FromInt32(8)),
+				},
+			},
+			expectError: "must be less than targetAvailable",
+		},
+		{
+			name: "percentage tolerance at 100 with absolute target - invalid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(10),
+					Tolerance:       intOrStrPtr(intstr.FromString("100%")),
+				},
+			},
+			expectError: "must be less than targetAvailable",
+		},
+		{
+			name: "absolute target with percentage tolerance below 100 - valid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(10),
+					Tolerance:       intOrStrPtr(intstr.FromString("50%")),
+				},
+			},
+			expectError: "",
+		},
+		{
+			name: "percentage target with absolute tolerance - not statically rejected",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 50,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("30%"),
+					Tolerance:       intOrStrPtr(intstr.FromInt32(10)),
+				},
 			},
 			expectError: "",
 		},
@@ -393,6 +554,9 @@ func TestHandle(t *testing.T) {
 				Name: "test-sbs",
 			},
 			MaxReplicas: 50,
+			CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(10),
+			},
 		},
 	}
 

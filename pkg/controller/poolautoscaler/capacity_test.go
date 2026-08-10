@@ -174,6 +174,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 	tests := []struct {
 		name            string
 		capacityPolicy  *agentsv1alpha1.CapacityPolicy
+		maxReplicas     int32
 		specReplicas    int32
 		statusReplicas  int32
 		available       int32
@@ -326,6 +327,68 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			expectedDesired: 10, // wait for in-flight replicas instead of stacking
 			expectedReason:  "waiting for in-flight sandboxes to become available",
 		},
+		{
+			name: "scale-down in progress (spec < status) — wait",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(7),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
+			specReplicas:    8,  // spec just lowered
+			statusReplicas:  10, // status still lagging behind
+			available:       9,  // above upper=8, but spec < status → wait
+			expectedDesired: 8,
+			expectedReason:  "waiting for previous scale-down to complete",
+		},
+		{
+			name: "scale-down guard not triggered when spec equals status",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(7),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
+			specReplicas:    10,
+			statusReplicas:  10,
+			available:       9, // above upper=8, excess=9-7=2
+			expectedDesired: 8, // 10 - 2 = 8
+			expectedReason:  "available above upper watermark",
+		},
+		{
+			name: "percentage: empty pool bootstraps against maxReplicas",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromString("50%"),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromString("10%")
+					return &v
+				}(),
+			},
+			maxReplicas:     10, // base = maxReplicas since pool is empty
+			specReplicas:    0,
+			statusReplicas:  0,
+			available:       0, // target=ceil(10*50%)=5, lower=4; deficit=5
+			expectedDesired: 5,
+			expectedReason:  "available below lower watermark",
+		},
+		{
+			name: "absolute target on empty pool does not bootstrap",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(3),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
+			maxReplicas:     10,
+			specReplicas:    0,
+			statusReplicas:  0,
+			available:       0, // target=3, lower=2; deficit=3
+			expectedDesired: 3,
+			expectedReason:  "available below lower watermark",
+		},
 	}
 
 	for _, tt := range tests {
@@ -335,6 +398,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			}
 			pa := &agentsv1alpha1.PoolAutoscaler{
 				Spec: agentsv1alpha1.PoolAutoscalerSpec{
+					MaxReplicas:    tt.maxReplicas,
 					CapacityPolicy: tt.capacityPolicy,
 				},
 			}

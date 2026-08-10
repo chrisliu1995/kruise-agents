@@ -62,6 +62,12 @@ var (
 // SandboxSet event handler and the conflict detection in Reconcile.
 const scaleTargetRefNameIndex = "spec.scaleTargetRef.name"
 
+// conflictRequeueInterval is the periodic requeue interval for a PoolAutoscaler
+// that lost the conflict resolution. The loser receives no further events while
+// the winner scales the shared SandboxSet, so it must re-check periodically to
+// take over once the winner disappears.
+const conflictRequeueInterval = 30 * time.Second
+
 // validateObservationParameters guards the observation window flags against
 // values that would break the controller: a zero sampling interval causes an
 // integer divide-by-zero panic and a zero requeueAfter busy loop; a negative
@@ -175,7 +181,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			Reason:             "Suspended",
 			Message:            "autoscaler is suspended",
 		})
-		if err := r.updateStatus(ctx, pa, pa.Status.CurrentReplicas, pa.Status.DesiredReplicas, pa.Status.CurrentCapacity.Available, nil, true, false, false, ""); err != nil {
+		if err := r.updateStatus(ctx, pa, paOriginal, pa.Status.CurrentReplicas, pa.Status.DesiredReplicas, pa.Status.CurrentCapacity.Available, nil, true, false, false, ""); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -224,7 +230,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			Message:            fmt.Sprintf("SandboxSet %q is already managed by older PoolAutoscaler %q", pa.Spec.ScaleTargetRef.Name, winnerName),
 		})
 		r.persistConditions(ctx, pa, paOriginal)
-		return ctrl.Result{}, nil
+		// Requeue periodically: the loser receives no events while the winner
+		// scales the shared SandboxSet, so it must re-check to take over once
+		// the winner is deleted.
+		return ctrl.Result{RequeueAfter: conflictRequeueInterval}, nil
 	}
 
 	setCondition(pa, metav1.Condition{
@@ -297,7 +306,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	scaled := (desiredReplicas != specReplicas)
-	if err := r.updateStatus(ctx, pa, statusReplicas, desiredReplicas, statusAvailable, result.appliedCronPolicies, false, scaled, limited, limitReason); err != nil {
+	if err := r.updateStatus(ctx, pa, paOriginal, statusReplicas, desiredReplicas, statusAvailable, result.appliedCronPolicies, false, scaled, limited, limitReason); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -392,8 +401,13 @@ func (r *Reconciler) doScale(ctx context.Context, sbs *agentsv1alpha1.SandboxSet
 }
 
 // updateStatus updates the PoolAutoscaler status fields.
-func (r *Reconciler) updateStatus(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, currentReplicas, desiredReplicas, available int32, appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus, suspended bool, scaled bool, limited bool, limitReason string) error {
-	paCopy := pa.DeepCopy()
+//
+// paOriginal is the object as fetched at the start of reconciliation, before
+// any status mutation (including conditions set by the caller, e.g. the
+// Suspended condition). It is used as the merge-patch base so that ALL status
+// changes made during this reconciliation — not just those inside this
+// function — are included in the patch and actually persisted.
+func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1alpha1.PoolAutoscaler, currentReplicas, desiredReplicas, available int32, appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus, suspended bool, scaled bool, limited bool, limitReason string) error {
 	pa.Status.ObservedGeneration = &pa.Generation
 	pa.Status.CurrentReplicas = currentReplicas
 	pa.Status.DesiredReplicas = desiredReplicas
@@ -413,13 +427,20 @@ func (r *Reconciler) updateStatus(ctx context.Context, pa *agentsv1alpha1.PoolAu
 		pa.Status.LastScaleTime = &now
 	}
 
-	r.setConditions(pa, desiredReplicas, limited, limitReason)
+	// When suspended, the caller already set the correct ScalingActive
+	// condition (False/Suspended) and the target was never read, so the
+	// generic conditions — which assert ScalingActive=True and
+	// AbleToScale=True — must not overwrite it. ScalingLimited needs no
+	// refresh either while scaling is halted.
+	if !suspended {
+		r.setConditions(pa, desiredReplicas, limited, limitReason)
+	}
 
-	if reflect.DeepEqual(pa.Status, paCopy.Status) {
+	if reflect.DeepEqual(pa.Status, paOriginal.Status) {
 		return nil
 	}
 
-	patch := client.MergeFrom(paCopy)
+	patch := client.MergeFrom(paOriginal)
 	return r.Status().Patch(ctx, pa, patch)
 }
 

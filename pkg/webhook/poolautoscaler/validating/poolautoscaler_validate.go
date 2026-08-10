@@ -104,7 +104,14 @@ func validatePoolAutoscalerSpec(spec agentsv1alpha1.PoolAutoscalerSpec, fldPath 
 
 	// Validate capacity policy
 	if spec.CapacityPolicy != nil {
-		errList = append(errList, validateCapacityPolicy(spec.CapacityPolicy, fldPath.Child("capacityPolicy"))...)
+		errList = append(errList, validateCapacityPolicy(spec.CapacityPolicy, spec.MaxReplicas, fldPath.Child("capacityPolicy"))...)
+	}
+
+	// An autoscaler without any scaling policy is a misconfiguration: bounds
+	// alone never change the replica count, so nothing would ever scale.
+	if spec.CapacityPolicy == nil && len(spec.CronPolicies) == 0 {
+		errList = append(errList, field.Invalid(fldPath, "",
+			"at least one scaling policy (capacityPolicy or cronPolicies) must be configured"))
 	}
 
 	return errList
@@ -145,7 +152,7 @@ func validateCronPolicies(policies []agentsv1alpha1.CronScalingPolicy, fldPath *
 	return errList
 }
 
-func validateCapacityPolicy(policy *agentsv1alpha1.CapacityPolicy, fldPath *field.Path) field.ErrorList {
+func validateCapacityPolicy(policy *agentsv1alpha1.CapacityPolicy, maxReplicas int32, fldPath *field.Path) field.ErrorList {
 	var errList field.ErrorList
 
 	// Validate targetAvailable
@@ -153,6 +160,15 @@ func validateCapacityPolicy(policy *agentsv1alpha1.CapacityPolicy, fldPath *fiel
 
 	// Validate tolerance
 	errList = append(errList, validateIntOrPercent(policy.Tolerance, fldPath.Child("tolerance"), 100)...)
+
+	// An absolute target above maxReplicas can never be reached because the
+	// pool size (and thus the available replicas) cannot exceed maxReplicas.
+	if policy.TargetAvailable.Type == intstr.Int && policy.TargetAvailable.IntVal > maxReplicas {
+		errList = append(errList, field.Invalid(fldPath.Child("targetAvailable"), policy.TargetAvailable.IntVal,
+			fmt.Sprintf("must not be greater than maxReplicas (%d), otherwise the target can never be reached", maxReplicas)))
+	}
+
+	errList = append(errList, validateToleranceAgainstTarget(policy, fldPath)...)
 
 	// Validate stabilization windows
 	if policy.ScaleUp != nil && policy.ScaleUp.StabilizationWindowSeconds != nil {
@@ -201,6 +217,59 @@ func validateIntOrPercent(v *intstr.IntOrString, fldPath *field.Path, allowedMax
 		errList = append(errList, field.Invalid(fldPath, v, "must be an integer or a percentage string"))
 	}
 	return errList
+}
+
+// validateToleranceAgainstTarget rejects tolerance values that are greater
+// than or equal to the target. Such configurations clamp the lower watermark
+// to 0, making the scale-up condition unreachable — the policy degenerates
+// into a one-way (scale-down only) scaler. Only statically decidable
+// combinations are checked; a percentage target combined with an absolute
+// tolerance depends on the runtime pool size and cannot be rejected here.
+func validateToleranceAgainstTarget(policy *agentsv1alpha1.CapacityPolicy, fldPath *field.Path) field.ErrorList {
+	var errList field.ErrorList
+	if policy.Tolerance == nil {
+		return errList
+	}
+	tolerance := *policy.Tolerance
+	target := policy.TargetAvailable
+	tolPath := fldPath.Child("tolerance")
+	msg := "must be less than targetAvailable, otherwise the lower watermark is clamped to 0 and scale-up can never trigger"
+
+	switch {
+	case target.Type == intstr.String && tolerance.Type == intstr.String:
+		if parseWebhookPercent(tolerance) >= parseWebhookPercent(target) {
+			errList = append(errList, field.Invalid(tolPath, tolerance.StrVal, msg))
+		}
+	case target.Type == intstr.Int && tolerance.Type == intstr.Int:
+		if tolerance.IntVal >= target.IntVal {
+			errList = append(errList, field.Invalid(tolPath, tolerance.IntVal, msg))
+		}
+	case target.Type == intstr.Int && tolerance.Type == intstr.String:
+		// A percentage tolerance >= 100% of the resolved target always covers
+		// the target entirely, regardless of the pool size.
+		if parseWebhookPercent(tolerance) >= 100 {
+			errList = append(errList, field.Invalid(tolPath, tolerance.StrVal, msg))
+		}
+		// Note: the remaining combination — percentage target with absolute
+		// tolerance — depends on the runtime pool size, so it cannot be
+		// statically rejected here.
+	}
+	return errList
+}
+
+// parseWebhookPercent extracts the numeric portion of an already-validated
+// percentage string (e.g. "70%" → 70). Returns 0 for malformed values, which
+// are rejected separately by validateIntOrPercent.
+func parseWebhookPercent(v intstr.IntOrString) int {
+	matches := percentPattern.FindStringSubmatch(v.StrVal)
+	if matches == nil {
+		return 0
+	}
+	p, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0
+	}
+	return p
 }
 
 // validateOneToOne ensures at most one PoolAutoscaler targets a given SandboxSet.

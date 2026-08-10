@@ -210,10 +210,20 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 	// Use avgReplicas as the percentage base.
 	// Combined with the SandboxSet watch, the autoscaler reacts immediately
 	// when available drops after claims.
+	//
+	// Empty-pool bootstrap: with a percentage target and an empty pool
+	// (avgReplicas == 0), every watermark resolves to 0 and the pool would
+	// sit in the dead zone forever, unable to bootstrap itself. Fall back
+	// to maxReplicas as the percentage base so the pool can seed its
+	// initial idle capacity.
+	percentageBase := avgReplicas
+	if pa.Spec.CapacityPolicy.TargetAvailable.Type == intstr.String && avgReplicas == 0 {
+		percentageBase = pa.Spec.MaxReplicas
+	}
 	targetAvailable, lowerWatermark, upperWatermark := computeWatermarks(
 		pa.Spec.CapacityPolicy.TargetAvailable,
 		pa.Spec.CapacityPolicy.Tolerance,
-		avgReplicas,
+		percentageBase,
 	)
 
 	logger.V(5).Info("Capacity policy evaluation",
@@ -255,6 +265,11 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 	// Scale down: available exceeded upper watermark.
 	// desired = avgReplicas - excess
 	if avgAvailable > upperWatermark {
+		// A previous scale-down is still converging (status lags spec) — wait
+		// instead of deriving a target from stale, larger status replicas.
+		if specReplicas < avgReplicas {
+			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-down to complete", cronStatuses, sourceCapacity}, nil
+		}
 		// Warm-up guard: never scale down before the observation window is fully
 		// populated (e.g. right after controller restart). Scale-up above stays
 		// unrestricted so capacity shortage is still handled promptly.

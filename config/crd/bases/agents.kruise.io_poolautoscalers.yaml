@@ -106,6 +106,8 @@ spec:
                     description: |-
                       TargetAvailable is the desired available replicas.
                       Can be an absolute number (ex: 5) or a percentage of current replicas (ex: 70%).
+                      When the pool is empty, a percentage target is bootstrapped against
+                      maxReplicas so the pool can seed its initial idle capacity.
                     x-kubernetes-int-or-string: true
                   tolerance:
                     anyOf:
@@ -166,6 +168,7 @@ spec:
                 minimum: 1
                 type: integer
               minReplicas:
+                default: 0
                 description: |-
                   MinReplicas is the lower limit for the number of replicas to which the autoscaler
                   can scale down. It defaults to 0 pods.

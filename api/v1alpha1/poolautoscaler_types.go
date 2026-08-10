@@ -21,8 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-var PoolAutoscalerControllerKind = GroupVersion.WithKind("PoolAutoscaler")
-
 // CrossVersionObjectReference contains enough information to let you identify the referred resource.
 type CrossVersionObjectReference struct {
 	// Kind of the referent; More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
@@ -55,6 +53,7 @@ type PoolAutoscalerSpec struct {
 	// can scale down. It defaults to 0 pods.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=0
 	MinReplicas int32 `json:"minReplicas"`
 
 	// CronPolicies is a list of potential cron scaling policies which can be used during scaling.
@@ -98,6 +97,8 @@ type CronScalingPolicy struct {
 type CapacityPolicy struct {
 	// TargetAvailable is the desired available replicas.
 	// Can be an absolute number (ex: 5) or a percentage of current replicas (ex: 70%).
+	// When the pool is empty, a percentage target is bootstrapped against
+	// maxReplicas so the pool can seed its initial idle capacity.
 	// +required
 	TargetAvailable intstr.IntOrString `json:"targetAvailable"`
 
