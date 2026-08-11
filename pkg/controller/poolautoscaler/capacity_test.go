@@ -232,12 +232,12 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			},
 			specReplicas:    5,
 			statusReplicas:  5,
-			available:       4, // below lower=6, inFlight=1, deficit=7-4-1=2
-			expectedDesired: 7, // statusReplicas(5) + 2 = 7
+			available:       4, // below lower=6, deficit=7-4=3
+			expectedDesired: 8, // statusReplicas(5) + 3 = 8
 			expectedReason:  "available below lower watermark",
 		},
 		{
-			name: "absolute: in-flight replicas suppress repeated scale-up",
+			name: "absolute: all replicas stuck creating — scale up by deficit",
 			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromInt32(7),
 				Tolerance: func() *intstr.IntOrString {
@@ -247,9 +247,9 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			},
 			specReplicas:    10,
 			statusReplicas:  10,
-			available:       4,  // below lower=6, but inFlight=6 covers the deficit
-			expectedDesired: 10, // no additional scale-up while pods are starting
-			expectedReason:  "waiting for in-flight sandboxes to become available",
+			available:       4,  // below lower=6, deficit=7-4=3
+			expectedDesired: 13, // 10 + 3 = 13
+			expectedReason:  "available below lower watermark",
 		},
 		{
 			name: "absolute: available in dead zone — stable",
@@ -313,7 +313,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			expectedReason:  "available above upper watermark",
 		},
 		{
-			name: "percentage: low readiness with in-flight replicas — wait",
+			name: "percentage: low readiness — scale up by deficit",
 			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromString("70%"),
 				Tolerance: func() *intstr.IntOrString {
@@ -323,9 +323,39 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			},
 			specReplicas:    10,
 			statusReplicas:  10,
-			available:       5,  // target=7, lower=6, 5<6 but inFlight=5 covers deficit
-			expectedDesired: 10, // wait for in-flight replicas instead of stacking
-			expectedReason:  "waiting for in-flight sandboxes to become available",
+			available:       5,  // target=7, lower=6, 5<6; deficit=7-5=2
+			expectedDesired: 12, // 10 + 2 = 12
+			expectedReason:  "available below lower watermark",
+		},
+		{
+			name: "percentage: scale up with 50% target",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromString("50%"),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromString("10%")
+					return &v
+				}(),
+			},
+			specReplicas:    10,
+			statusReplicas:  10,
+			available:       3,  // target=ceil(10*50%)=5, lower=ceil(10*40%)=4; deficit=5-3=2
+			expectedDesired: 12, // 10 + 2 = 12
+			expectedReason:  "available below lower watermark",
+		},
+		{
+			name: "percentage: above upper watermark — scale down",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromString("50%"),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromString("20%")
+					return &v
+				}(),
+			},
+			specReplicas:    10,
+			statusReplicas:  10,
+			available:       8, // target=ceil(10*50%)=5, upper=ceil(10*70%)=7; 8>7, excess=8-5=3
+			expectedDesired: 7, // 10 - 3 = 7
+			expectedReason:  "available above upper watermark",
 		},
 		{
 			name: "scale-down in progress (spec < status) — wait",
@@ -358,7 +388,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			expectedReason:  "available above upper watermark",
 		},
 		{
-			name: "percentage: empty pool bootstraps against maxReplicas",
+			name: "percentage: minReplicas=1 pool can bootstrap",
 			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromString("50%"),
 				Tolerance: func() *intstr.IntOrString {
@@ -366,15 +396,15 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
-			maxReplicas:     10, // base = maxReplicas since pool is empty
-			specReplicas:    0,
-			statusReplicas:  0,
-			available:       0, // target=ceil(10*50%)=5, lower=4; deficit=5
-			expectedDesired: 5,
+			maxReplicas:     10,
+			specReplicas:    1,
+			statusReplicas:  1,
+			available:       0, // target=ceil(1*50%)=1, lower=ceil(1*40%)=1; 0<1, deficit=1-0=1
+			expectedDesired: 2, // 1 + 1 = 2
 			expectedReason:  "available below lower watermark",
 		},
 		{
-			name: "absolute target on empty pool does not bootstrap",
+			name: "absolute target on empty pool scales up",
 			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromInt32(3),
 				Tolerance: func() *intstr.IntOrString {
@@ -423,8 +453,9 @@ func TestComputeDesiredReplicas(t *testing.T) {
 // TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp is a regression test
 // for the runaway scale-up bug: when sandboxes stay in Creating for a long
 // time, statusReplicas catches up with specReplicas while available remains 0.
-// Every subsequent evaluation must NOT add a fresh deficit on top of the
-// previous scale-up.
+// The in-progress guard (specReplicas > avgReplicas) prevents repeated scale-ups:
+// after the first scale-up sets a higher spec, subsequent evaluations see
+// specReplicas > avgReplicas and wait.
 func TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp(t *testing.T) {
 	r := &Reconciler{
 		monitors: make(map[types.NamespacedName]*capacityMonitor),
@@ -443,13 +474,20 @@ func TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp(t *testing.T) {
 	pa.Name = "test-pa"
 	pa.Namespace = "default"
 
-	// spec=10, statusReplicas caught up to 10 (all Creating), available=0.
-	// Repeated evaluations must keep desired at 10 instead of stacking deficits.
+	// First evaluation: spec=10, status=10, available=0 → triggers scale-up.
+	// deficit = 10 - 0 = 10, desired = 10 + 10 = 20.
+	result, err := r.computeDesiredReplicas(context.Background(), pa, 10, 10, 0, 3)
+	require.NoError(t, err)
+	assert.Equal(t, int32(20), result.desiredReplicas)
+	assert.Contains(t, result.reason, "available below lower watermark")
+
+	// After the first scale-up: spec=20, status=10 (still creating), available=0.
+	// Now specReplicas(20) > avgReplicas(10) → the in-progress guard fires.
 	for i := 0; i < 5; i++ {
-		result, err := r.computeDesiredReplicas(context.Background(), pa, 10, 10, 0, 3)
+		result, err = r.computeDesiredReplicas(context.Background(), pa, 20, 10, 0, 3)
 		require.NoError(t, err)
-		assert.Equal(t, int32(10), result.desiredReplicas, "iteration %d must not scale up again", i)
-		assert.Contains(t, result.reason, "waiting for in-flight sandboxes to become available")
+		assert.Equal(t, int32(20), result.desiredReplicas, "iteration %d must not scale up again", i)
+		assert.Contains(t, result.reason, "waiting for previous scale-up to complete")
 	}
 }
 

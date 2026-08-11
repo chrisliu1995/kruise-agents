@@ -706,11 +706,10 @@ spec:
 - **Upper Watermark (Scale-Down Trigger)**: `Current Replicas × (70% + 10%) = Current Replicas × 80%` (rounded up)
 - **Dead Zone**: Between lower and upper watermarks, no scaling occurs
 
-**Empty-Pool Bootstrap**: When the pool is empty (current replicas = 0), a percentage target
-would resolve all watermarks to 0, leaving the pool stuck in the dead zone and unable to
-bootstrap itself. In this case the autoscaler resolves the percentage against `maxReplicas`
-instead, so the pool can seed its initial idle capacity (e.g. `targetAvailable: "50%"` with
-`maxReplicas: 10` bootstraps the pool to 5 available replicas).
+**Empty-Pool Prevention**: For percentage-based `targetAvailable`, `minReplicas` must be at
+least 1 (enforced by webhook) to ensure the pool can bootstrap. The percentage base is the
+current observed pool size (`avgReplicas`). With `minReplicas >= 1`, the SandboxSet always has
+at least one replica, so percentage watermarks never resolve to 0.
 
 **Scaling Behavior Timeline with Percentage-Based Watermarks**:
 

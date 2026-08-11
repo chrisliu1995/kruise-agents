@@ -105,6 +105,14 @@ func validatePoolAutoscalerSpec(spec agentsv1alpha1.PoolAutoscalerSpec, fldPath 
 	// Validate capacity policy
 	if spec.CapacityPolicy != nil {
 		errList = append(errList, validateCapacityPolicy(spec.CapacityPolicy, spec.MaxReplicas, fldPath.Child("capacityPolicy"))...)
+
+		// Percentage targetAvailable requires minReplicas >= 1: with an empty pool
+		// (replicas == 0), percentage watermarks all resolve to 0 and the pool can
+		// never bootstrap itself.
+		if spec.CapacityPolicy.TargetAvailable.Type == intstr.String && spec.MinReplicas < 1 {
+			errList = append(errList, field.Invalid(fldPath.Child("minReplicas"), spec.MinReplicas,
+				"percentage targetAvailable requires minReplicas >= 1 to prevent empty-pool deadlock"))
+		}
 	}
 
 	// An autoscaler without any scaling policy is a misconfiguration: bounds

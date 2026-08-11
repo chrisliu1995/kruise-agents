@@ -294,8 +294,54 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 					Name: "my-pool",
 				},
 				MaxReplicas: 10,
+				MinReplicas: 1,
 				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
 					TargetAvailable: intstr.FromString("70%"),
+				},
+			},
+			expectError: "",
+		},
+		{
+			name: "percentage targetAvailable with minReplicas=0 - invalid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 10,
+				MinReplicas: 0,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("50%"),
+				},
+			},
+			expectError: "percentage targetAvailable requires minReplicas >= 1 to prevent empty-pool deadlock",
+		},
+		{
+			name: "percentage targetAvailable with minReplicas=1 - valid",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 10,
+				MinReplicas: 1,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromString("50%"),
+				},
+			},
+			expectError: "",
+		},
+		{
+			name: "absolute targetAvailable with minReplicas=0 - valid (no deadlock)",
+			spec: agentsv1alpha1.PoolAutoscalerSpec{
+				ScaleTargetRef: agentsv1alpha1.CrossVersionObjectReference{
+					Kind: "SandboxSet",
+					Name: "my-pool",
+				},
+				MaxReplicas: 10,
+				MinReplicas: 0,
+				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
+					TargetAvailable: intstr.FromInt32(5),
 				},
 			},
 			expectError: "",
@@ -398,6 +444,7 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 					Name: "my-pool",
 				},
 				MaxReplicas: 50,
+				MinReplicas: 1,
 				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
 					TargetAvailable: intstr.FromString("30%"),
 					Tolerance:       intOrStrPtr(intstr.FromInt32(10)),
@@ -413,6 +460,7 @@ func TestValidatePoolAutoscalerSpec(t *testing.T) {
 					Name: "my-pool",
 				},
 				MaxReplicas: 50,
+				MinReplicas: 1,
 				CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
 					TargetAvailable: intstr.FromString("70%"),
 					Tolerance:       intOrStrPtr(intstr.FromString("10%")),

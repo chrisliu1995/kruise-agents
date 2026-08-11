@@ -207,23 +207,16 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 		return computeDesiredReplicasResult{specReplicas, "no scaling policy", cronStatuses, sourceBounds}, nil
 	}
 
-	// Use avgReplicas as the percentage base.
-	// Combined with the SandboxSet watch, the autoscaler reacts immediately
-	// when available drops after claims.
-	//
-	// Empty-pool bootstrap: with a percentage target and an empty pool
-	// (avgReplicas == 0), every watermark resolves to 0 and the pool would
-	// sit in the dead zone forever, unable to bootstrap itself. Fall back
-	// to maxReplicas as the percentage base so the pool can seed its
-	// initial idle capacity.
-	percentageBase := avgReplicas
-	if pa.Spec.CapacityPolicy.TargetAvailable.Type == intstr.String && avgReplicas == 0 {
-		percentageBase = pa.Spec.MaxReplicas
-	}
+	// Use avgReplicas as the percentage base for watermark calculations.
+	// Combined with the SandboxSet watch and the in-progress guard
+	// (specReplicas > avgReplicas), the autoscaler reacts immediately
+	// when available drops after claims without runaway feedback loops.
+	// For percentage targets, minReplicas >= 1 is enforced by the webhook
+	// to prevent empty-pool deadlock (target = pct * 0 = 0).
 	targetAvailable, lowerWatermark, upperWatermark := computeWatermarks(
 		pa.Spec.CapacityPolicy.TargetAvailable,
 		pa.Spec.CapacityPolicy.Tolerance,
-		percentageBase,
+		avgReplicas,
 	)
 
 	logger.V(5).Info("Capacity policy evaluation",
@@ -243,20 +236,9 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 		if specReplicas > avgReplicas {
 			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-up to complete", cronStatuses, sourceCapacity}, nil
 		}
-		// In-flight replicas: created but not yet available (still starting up).
-		// The deficit must exclude them, otherwise every reconcile while pods are
-		// Creating would add a fresh deficit on top of the previous scale-up.
-		// Treating all non-available replicas as in-flight is conservative: it may
-		// under-scale when many replicas are claimed, but claims consume sandboxes
-		// which leave the set and trigger replenishment by the SandboxSet
-		// controller itself.
-		inFlight := avgReplicas - avgAvailable
-		if inFlight < 0 {
-			inFlight = 0
-		}
-		deficit := targetAvailable - avgAvailable - inFlight
+		deficit := targetAvailable - avgAvailable
 		if deficit <= 0 {
-			return computeDesiredReplicasResult{specReplicas, "waiting for in-flight sandboxes to become available", cronStatuses, sourceCapacity}, nil
+			deficit = 1 // Safety: if below lower watermark, always scale up by at least 1
 		}
 		desired := avgReplicas + deficit
 		return computeDesiredReplicasResult{desired, "available below lower watermark", cronStatuses, sourceCapacity}, nil

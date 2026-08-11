@@ -44,10 +44,10 @@ import (
 func init() {
 	flag.IntVar(&concurrentReconciles, "poolautoscaler-workers", concurrentReconciles,
 		"Max concurrent workers for PoolAutoscaler controller.")
-	flag.IntVar(&observationWindowSeconds, "observation-window-seconds", observationWindowSeconds,
+	flag.IntVar(&observationWindowSeconds, "poolautoscaler-observation-window-seconds", observationWindowSeconds,
 		"Observation window in seconds for PoolAutoscaler capacity monitoring. "+
 			"Samples within this window are averaged before making scaling decisions.")
-	flag.IntVar(&samplingIntervalSeconds, "sampling-interval-seconds", samplingIntervalSeconds,
+	flag.IntVar(&samplingIntervalSeconds, "poolautoscaler-sampling-interval-seconds", samplingIntervalSeconds,
 		"Sampling interval in seconds for PoolAutoscaler capacity monitoring. "+
 			"Controls how frequently (available, statusReplicas) samples are collected.")
 }
@@ -77,8 +77,8 @@ const conflictRequeueInterval = 30 * time.Second
 // error here would take down all other controllers.
 func validateObservationParameters() {
 	if samplingIntervalSeconds <= 0 || observationWindowSeconds <= 0 || observationWindowSeconds < samplingIntervalSeconds {
-		klog.Warningf("Invalid PoolAutoscaler observation parameters (observation-window-seconds=%d, sampling-interval-seconds=%d); "+
-			"falling back to defaults (observation-window-seconds=%d, sampling-interval-seconds=%d)",
+		klog.Warningf("Invalid PoolAutoscaler observation parameters (poolautoscaler-observation-window-seconds=%d, poolautoscaler-sampling-interval-seconds=%d); "+
+			"falling back to defaults (poolautoscaler-observation-window-seconds=%d, poolautoscaler-sampling-interval-seconds=%d)",
 			observationWindowSeconds, samplingIntervalSeconds,
 			defaultObservationWindowSeconds, defaultSamplingIntervalSeconds)
 		observationWindowSeconds = defaultObservationWindowSeconds
