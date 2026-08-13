@@ -700,7 +700,7 @@ func TestRecordScale(t *testing.T) {
 }
 
 func TestAddSampleIfDue(t *testing.T) {
-	expectedCap := int(observationWindowSeconds/samplingIntervalSeconds) + 1 // 4 with default 15/5
+	expectedCap := int(observationWindowSeconds/samplingIntervalSeconds) + 1 // 7 with default 30/5
 
 	tests := []struct {
 		name           string

@@ -46,7 +46,7 @@ const (
 // Observation window parameters — set once via command-line flags at startup
 // and read-only afterwards. NOT safe for concurrent modification at runtime.
 const (
-	defaultObservationWindowSeconds = 15
+	defaultObservationWindowSeconds = 30
 	defaultSamplingIntervalSeconds  = 5
 )
 

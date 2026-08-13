@@ -892,12 +892,12 @@ The autoscaler exposes the following configuration parameters:
 
 - **Observation Window Duration** (`observationWindowSeconds`):
 The total time window over which samples are collected and aggregated
-    - **Default**: 60 seconds
+    - **Default**: 30 seconds
     - **Range**: 30-300 seconds
     - **Purpose**: Determines how much historical data is considered for scaling decisions
 
 - **Sampling Interval** (`samplingIntervalSeconds`): The time interval between consecutive sampling operations
-    - **Default**: 15 seconds
+    - **Default**: 5 seconds
     - **Range**: 5-30 seconds
     - **Purpose**: Controls the frequency of resource state queries
 
