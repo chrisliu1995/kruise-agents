@@ -229,32 +229,55 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 	)
 
 	// Scale up: available dropped below lower watermark.
-	// desired = avgReplicas + deficit
-	// Guard: don't scale up further while a previous scale-up is still in progress
-	// (pods are being created). This prevents runaway feedback loops.
+	// desired = avgReplicas + deficit, clamped to maxReplicas below.
 	if avgAvailable < lowerWatermark {
+		// Guard: don't scale up further while a previous scale-up is still in progress
+		// (pods are being created). This prevents runaway feedback loops. Checked
+		// before the warm-up guard so an in-progress scale-up keeps reporting its
+		// specific wait reason even while the observation window is filling up.
 		if specReplicas > avgReplicas {
 			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-up to complete", cronStatuses, sourceCapacity}, nil
+		}
+		// Warm-up guard, symmetric with scale-down below: both directions wait
+		// until the observation window is fully populated (e.g. right after
+		// controller restart), so every capacity decision is based on a complete
+		// statistical picture. The expected trade-off is that the capacity path
+		// performs no scaling for roughly one observation window after a restart.
+		expectedSamples := observationWindowSeconds / samplingIntervalSeconds
+		if sampleCount < expectedSamples {
+			return computeDesiredReplicasResult{specReplicas, "insufficient observation samples for scale-up", cronStatuses, sourceCapacity}, nil
 		}
 		deficit := targetAvailable - avgAvailable
 		if deficit <= 0 {
 			deficit = 1 // Safety: if below lower watermark, always scale up by at least 1
 		}
 		desired := avgReplicas + deficit
+		// Clamp to maxReplicas inside the capacity path so the decision carries
+		// the correct boundary semantics instead of relying on the controller's
+		// generic clampToBounds, which would misreport a pool already at the
+		// boundary.
+		if desired > pa.Spec.MaxReplicas {
+			if pa.Spec.MaxReplicas == specReplicas {
+				return computeDesiredReplicasResult{specReplicas, "already at maxReplicas, scale-up skipped", cronStatuses, sourceCapacity}, nil
+			}
+			return computeDesiredReplicasResult{pa.Spec.MaxReplicas, "scale-up limited by maxReplicas", cronStatuses, sourceCapacity}, nil
+		}
 		return computeDesiredReplicasResult{desired, "available below lower watermark", cronStatuses, sourceCapacity}, nil
 	}
 
 	// Scale down: available exceeded upper watermark.
-	// desired = avgReplicas - excess
+	// desired = avgReplicas - excess, clamped to minReplicas below.
 	if avgAvailable > upperWatermark {
 		// A previous scale-down is still converging (status lags spec) — wait
 		// instead of deriving a target from stale, larger status replicas.
 		if specReplicas < avgReplicas {
 			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-down to complete", cronStatuses, sourceCapacity}, nil
 		}
-		// Warm-up guard: never scale down before the observation window is fully
-		// populated (e.g. right after controller restart). Scale-up above stays
-		// unrestricted so capacity shortage is still handled promptly.
+		// Warm-up guard, symmetric with scale-up above: both directions wait
+		// until the observation window is fully populated (e.g. right after
+		// controller restart), so every capacity decision is based on a complete
+		// statistical picture. The expected trade-off is that the capacity path
+		// performs no scaling for roughly one observation window after a restart.
 		expectedSamples := observationWindowSeconds / samplingIntervalSeconds
 		if sampleCount < expectedSamples {
 			return computeDesiredReplicasResult{specReplicas, "insufficient observation samples for scale-down", cronStatuses, sourceCapacity}, nil
@@ -263,6 +286,16 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 		desired := avgReplicas - excess
 		if desired < 0 {
 			desired = 0
+		}
+		// Clamp to minReplicas inside the capacity path so the decision carries
+		// the correct boundary semantics instead of relying on the controller's
+		// generic clampToBounds, which would misreport a pool already at the
+		// boundary.
+		if desired < pa.Spec.MinReplicas {
+			if pa.Spec.MinReplicas == specReplicas {
+				return computeDesiredReplicasResult{specReplicas, "already at minReplicas, scale-down skipped", cronStatuses, sourceCapacity}, nil
+			}
+			return computeDesiredReplicasResult{pa.Spec.MinReplicas, "scale-down limited by minReplicas", cronStatuses, sourceCapacity}, nil
 		}
 		return computeDesiredReplicasResult{desired, "available above upper watermark", cronStatuses, sourceCapacity}, nil
 	}
@@ -366,7 +399,7 @@ func (r *Reconciler) applyStabilizationWindow(pa *agentsv1alpha1.PoolAutoscaler,
 // observation window.
 //
 // The aggregated values are passed to computeDesiredReplicas as if they were
-// instantaneous values. computeDesiredReplicas does not change.
+// instantaneous values.
 func (r *Reconciler) observeAndAggregate(
 	ctx context.Context,
 	pa *agentsv1alpha1.PoolAutoscaler,

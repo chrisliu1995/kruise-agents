@@ -174,6 +174,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 	tests := []struct {
 		name            string
 		capacityPolicy  *agentsv1alpha1.CapacityPolicy
+		minReplicas     int32
 		maxReplicas     int32
 		specReplicas    int32
 		statusReplicas  int32
@@ -230,11 +231,65 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     2,
+			maxReplicas:     20,
 			specReplicas:    5,
 			statusReplicas:  5,
 			available:       4, // below lower=6, deficit=7-4=3
 			expectedDesired: 8, // statusReplicas(5) + 3 = 8
 			expectedReason:  "available below lower watermark",
+		},
+		{
+			name: "scale-up blocked by insufficient samples",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(7),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
+			minReplicas:     2,
+			maxReplicas:     20,
+			specReplicas:    5,
+			statusReplicas:  5,
+			available:       4, // below lower=6, but only one sample observed
+			sampleCount:     1,
+			expectedDesired: 5,
+			expectedReason:  "insufficient observation samples for scale-up",
+		},
+		{
+			name: "scale-up clamped to maxReplicas",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(7),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
+			minReplicas:     2,
+			maxReplicas:     7,
+			specReplicas:    5,
+			statusReplicas:  5,
+			available:       4, // below lower=6, raw desired=8 > max=7
+			expectedDesired: 7,
+			expectedReason:  "scale-up limited by maxReplicas",
+		},
+		{
+			name: "already at maxReplicas — no scale-up",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(7),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
+			minReplicas:     2,
+			maxReplicas:     5,
+			specReplicas:    5,
+			statusReplicas:  5,
+			available:       4, // below lower=6, raw desired=8 > max=5=spec
+			expectedDesired: 5,
+			expectedReason:  "already at maxReplicas, scale-up skipped",
 		},
 		{
 			name: "absolute: all replicas stuck creating — scale up by deficit",
@@ -245,6 +300,8 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     2,
+			maxReplicas:     20,
 			specReplicas:    10,
 			statusReplicas:  10,
 			available:       4,  // below lower=6, deficit=7-4=3
@@ -275,11 +332,49 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     5,
+			maxReplicas:     20,
 			specReplicas:    10,
 			statusReplicas:  10,
 			available:       9, // above upper=8, excess=9-7=2
 			expectedDesired: 8, // 10 - 2 = 8
 			expectedReason:  "available above upper watermark",
+		},
+		{
+			name: "scale-down clamped to minReplicas",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromInt32(7),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromInt32(1)
+					return &v
+				}(),
+			},
+			minReplicas:     9,
+			maxReplicas:     20,
+			specReplicas:    10,
+			statusReplicas:  10,
+			available:       9, // above upper=8, raw desired=8 < min=9
+			expectedDesired: 9,
+			expectedReason:  "scale-down limited by minReplicas",
+		},
+		{
+			name: "already at minReplicas — no scale-down",
+			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
+				TargetAvailable: intstr.FromString("50%"),
+				Tolerance: func() *intstr.IntOrString {
+					v := intstr.FromString("10%")
+					return &v
+				}(),
+			},
+			minReplicas: 20,
+			maxReplicas: 40,
+			// Pool pinned at the minimum: spec = status = available = min.
+			// target=10, upper=12; available(20) > upper, raw desired=10 < min=20.
+			specReplicas:    20,
+			statusReplicas:  20,
+			available:       20,
+			expectedDesired: 20,
+			expectedReason:  "already at minReplicas, scale-down skipped",
 		},
 		{
 			name: "insufficient samples block scale-down",
@@ -306,6 +401,8 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     5,
+			maxReplicas:     20,
 			specReplicas:    10,
 			statusReplicas:  10,
 			available:       10, // target=7, excess=10-7=3
@@ -321,6 +418,8 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     2,
+			maxReplicas:     20,
 			specReplicas:    10,
 			statusReplicas:  10,
 			available:       5,  // target=7, lower=6, 5<6; deficit=7-5=2
@@ -336,6 +435,8 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     2,
+			maxReplicas:     20,
 			specReplicas:    10,
 			statusReplicas:  10,
 			available:       3,  // target=ceil(10*50%)=5, lower=ceil(10*40%)=4; deficit=5-3=2
@@ -351,6 +452,8 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     5,
+			maxReplicas:     20,
 			specReplicas:    10,
 			statusReplicas:  10,
 			available:       8, // target=ceil(10*50%)=5, upper=ceil(10*70%)=7; 8>7, excess=8-5=3
@@ -381,6 +484,8 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     5,
+			maxReplicas:     20,
 			specReplicas:    10,
 			statusReplicas:  10,
 			available:       9, // above upper=8, excess=9-7=2
@@ -396,6 +501,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     1,
 			maxReplicas:     10,
 			specReplicas:    1,
 			statusReplicas:  1,
@@ -412,6 +518,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     0,
 			maxReplicas:     10,
 			specReplicas:    0,
 			statusReplicas:  0,
@@ -428,6 +535,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			}
 			pa := &agentsv1alpha1.PoolAutoscaler{
 				Spec: agentsv1alpha1.PoolAutoscalerSpec{
+					MinReplicas:    tt.minReplicas,
 					MaxReplicas:    tt.maxReplicas,
 					CapacityPolicy: tt.capacityPolicy,
 				},
@@ -462,6 +570,7 @@ func TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp(t *testing.T) {
 	}
 	pa := &agentsv1alpha1.PoolAutoscaler{
 		Spec: agentsv1alpha1.PoolAutoscalerSpec{
+			MaxReplicas: 100,
 			CapacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromInt32(10),
 				Tolerance: func() *intstr.IntOrString {
@@ -474,9 +583,13 @@ func TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp(t *testing.T) {
 	pa.Name = "test-pa"
 	pa.Namespace = "default"
 
+	// Scale-up now requires a fully populated observation window; pass a full
+	// window's worth of samples.
+	fullWindowSamples := observationWindowSeconds / samplingIntervalSeconds
+
 	// First evaluation: spec=10, status=10, available=0 → triggers scale-up.
 	// deficit = 10 - 0 = 10, desired = 10 + 10 = 20.
-	result, err := r.computeDesiredReplicas(context.Background(), pa, 10, 10, 0, 3)
+	result, err := r.computeDesiredReplicas(context.Background(), pa, 10, 10, 0, fullWindowSamples)
 	require.NoError(t, err)
 	assert.Equal(t, int32(20), result.desiredReplicas)
 	assert.Contains(t, result.reason, "available below lower watermark")
@@ -484,7 +597,7 @@ func TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp(t *testing.T) {
 	// After the first scale-up: spec=20, status=10 (still creating), available=0.
 	// Now specReplicas(20) > avgReplicas(10) → the in-progress guard fires.
 	for i := 0; i < 5; i++ {
-		result, err = r.computeDesiredReplicas(context.Background(), pa, 20, 10, 0, 3)
+		result, err = r.computeDesiredReplicas(context.Background(), pa, 20, 10, 0, fullWindowSamples)
 		require.NoError(t, err)
 		assert.Equal(t, int32(20), result.desiredReplicas, "iteration %d must not scale up again", i)
 		assert.Contains(t, result.reason, "waiting for previous scale-up to complete")

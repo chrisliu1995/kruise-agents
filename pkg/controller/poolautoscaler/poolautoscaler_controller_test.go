@@ -183,6 +183,21 @@ func TestReconcile(t *testing.T) {
 					}),
 				newSandboxSet("test-sbs", "default", 5, 5, 5),
 			},
+			// Scale-up requires a fully populated observation window; pre-fill
+			// the monitor with a full window of samples matching the fixture.
+			setupMonitors: func(r *Reconciler) {
+				now := time.Now()
+				interval := time.Duration(samplingIntervalSeconds) * time.Second
+				monitor := &capacityMonitor{targetRef: "test-sbs", lastSampleAt: now}
+				for i := observationWindowSeconds / samplingIntervalSeconds; i > 0; i-- {
+					monitor.samples = append(monitor.samples, sample{
+						timestamp:      now.Add(-time.Duration(i-1) * interval),
+						available:      5,
+						statusReplicas: 5,
+					})
+				}
+				r.monitors[types.NamespacedName{Namespace: "default", Name: "test-pa"}] = monitor
+			},
 			req:               ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-pa", Namespace: "default"}},
 			expectError:       "",
 			expectSBSReplicas: int32Ptr(10),

@@ -383,6 +383,11 @@ func (r *Reconciler) getSandboxSet(ctx context.Context, pa *agentsv1alpha1.PoolA
 // clampToBounds enforces minReplicas and maxReplicas constraints. It reports
 // whether the desired value was limited by a bound and which bound applied
 // ("TooFewReplicas" for the minimum, "TooManyReplicas" for the maximum).
+//
+// The capacity path already clamps its desired value to [minReplicas,
+// maxReplicas] inside computeDesiredReplicas and reports the boundary via its
+// reason, so this function only acts as a safety net for paths that do not
+// clamp themselves (e.g. cron-triggered targets).
 func (r *Reconciler) clampToBounds(pa *agentsv1alpha1.PoolAutoscaler, desired int32) (int32, bool, string) {
 	if desired < pa.Spec.MinReplicas {
 		return pa.Spec.MinReplicas, true, "TooFewReplicas"
