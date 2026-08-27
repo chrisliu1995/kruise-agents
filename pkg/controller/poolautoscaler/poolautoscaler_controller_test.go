@@ -127,8 +127,12 @@ func TestReconcile(t *testing.T) {
 		expectDesired     *int32
 		expectSuspended   *bool
 		// expectScalingActiveReason, when non-empty, asserts that the
-		// ScalingActive condition is False with this reason.
+		// ScalingActive condition has this reason. Its expected status is
+		// ConditionFalse unless expectScalingActiveStatus overrides it.
 		expectScalingActiveReason string
+		// expectScalingActiveStatus, when non-empty, overrides the expected
+		// ScalingActive status (defaults to ConditionFalse).
+		expectScalingActiveStatus metav1.ConditionStatus
 	}{
 		{
 			name:        "PoolAutoscaler not found - returns nil",
@@ -248,6 +252,26 @@ func TestReconcile(t *testing.T) {
 			expectSBSReplicas: int32Ptr(10),
 			expectDesired:     int32Ptr(10),
 		},
+		{
+			name: "capacity scaling blocked during observation window warm-up",
+			objs: []client.Object{
+				newPoolAutoscaler("test-pa", "default", "test-sbs", 20,
+					&agentsv1alpha1.CapacityPolicy{
+						TargetAvailable: intstr.FromInt32(10),
+						Tolerance:       intOrStrPtr(intstr.FromInt32(2)),
+					}),
+				newSandboxSet("test-sbs", "default", 5, 5, 5),
+			},
+			// No setupMonitors: the reconcile creates the monitor and records a
+			// single sample, so windowIsWarm() is false and the capacity path is
+			// blocked even though available (5) is below the lower watermark.
+			req:         ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-pa", Namespace: "default"}},
+			expectError: "",
+			// spec.replicas must stay unchanged: no scale-up during warm-up.
+			expectSBSReplicas:         int32Ptr(5),
+			expectScalingActiveReason: "InsufficientObservationWindow",
+			expectScalingActiveStatus: metav1.ConditionTrue,
+		},
 	}
 
 	for _, tt := range tests {
@@ -292,7 +316,11 @@ func TestReconcile(t *testing.T) {
 						}
 					}
 					require.NotNil(t, scalingActive, "ScalingActive condition must be persisted")
-					assert.Equal(t, metav1.ConditionFalse, scalingActive.Status, "ScalingActive must remain False")
+					wantStatus := metav1.ConditionFalse
+					if tt.expectScalingActiveStatus != "" {
+						wantStatus = tt.expectScalingActiveStatus
+					}
+					assert.Equal(t, wantStatus, scalingActive.Status, "ScalingActive status mismatch")
 					assert.Equal(t, tt.expectScalingActiveReason, scalingActive.Reason, "ScalingActive reason mismatch")
 				}
 			}
@@ -500,7 +528,7 @@ func TestUpdateStatus(t *testing.T) {
 			r := newTestReconciler(pa)
 			paOriginal := pa.DeepCopy()
 
-			err := r.updateStatus(context.Background(), pa, paOriginal, tt.currentReplicas, tt.desiredReplicas, tt.available, nil, tt.suspended, tt.scaled, false, "", "")
+			err := r.updateStatus(context.Background(), pa, paOriginal, tt.currentReplicas, tt.desiredReplicas, tt.available, nil, tt.suspended, tt.scaled, false, "", "", false)
 			require.NoError(t, err)
 
 			got := &agentsv1alpha1.PoolAutoscaler{}
@@ -584,7 +612,7 @@ func TestSetConditions(t *testing.T) {
 					MaxReplicas: 20,
 				},
 			}
-			r.setConditions(pa, tt.desiredReplicas, tt.limited, tt.limitReason, "")
+			r.setConditions(pa, tt.desiredReplicas, tt.limited, tt.limitReason, "", false)
 
 			// Should have 3 conditions: ScalingActive, AbleToScale, and ScalingLimited
 			assert.Len(t, pa.Status.Conditions, 3)

@@ -181,7 +181,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			Reason:             "Suspended",
 			Message:            "autoscaler is suspended",
 		})
-		if err := r.updateStatus(ctx, pa, paOriginal, pa.Status.CurrentReplicas, pa.Status.DesiredReplicas, pa.Status.CurrentCapacity.Available, nil, true, false, false, "", ""); err != nil {
+		if err := r.updateStatus(ctx, pa, paOriginal, pa.Status.CurrentReplicas, pa.Status.DesiredReplicas, pa.Status.CurrentCapacity.Available, nil, true, false, false, "", "", false); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -249,13 +249,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	statusReplicas := sbs.Status.Replicas
 	statusAvailable := sbs.Status.AvailableReplicas
 
-	avgAvailable, avgReplicas, sampleCount := r.observeAndAggregate(ctx, pa, statusAvailable, statusReplicas)
+	avgAvailable, avgReplicas, _ := r.observeAndAggregate(ctx, pa, statusAvailable, statusReplicas)
 
 	// Retrieve the monitor early — needed for the warm-up check and requeue logic.
 	key := types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}
 	monitor := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name)
 
-	result, err := r.computeDesiredReplicas(ctx, pa, specReplicas, avgReplicas, avgAvailable, sampleCount)
+	result, err := r.computeDesiredReplicas(ctx, pa, specReplicas, avgReplicas, avgAvailable)
 	if err != nil {
 		r.recorder.Eventf(pa, "Warning", "FailedComputeReplicas",
 			"Failed to compute desired replicas: %v", err)
@@ -265,19 +265,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Warm-up guard: capacity path requires the observation window to be
 	// sufficiently populated before making scaling decisions. Cron-triggered
 	// scaling bypasses this check since it represents explicit user intent.
-	if result.source != sourceCron && !monitor.windowIsWarm() {
+	warmingUp := result.source != sourceCron && !monitor.windowIsWarm()
+	if warmingUp {
 		result.desiredReplicas = specReplicas
 		result.reason = "observation window not yet warm enough for capacity scaling"
 		result.limitReason = ""
-		setCondition(pa, metav1.Condition{
-			Type:               string(agentsv1alpha1.ScalingActive),
-			Status:             metav1.ConditionTrue,
-			LastTransitionTime: metav1.Now(),
-			ObservedGeneration: pa.Generation,
-			Reason:             "InsufficientObservationWindow",
-			Message:            "the observation window has not collected enough samples to make a capacity scaling decision",
-		})
 	}
+
+	// Note: clampToBounds is always applied even during warm-up to enforce hard
+	// safety bounds (minReplicas/maxReplicas). If the current spec is outside
+	// [min, max] (e.g. due to a manual edit), the clamp will correct it regardless
+	// of the warm-up state.
 
 	// Determine ScalingLimited from the capacity path's limitReason first;
 	// fall back to clampToBounds (for cron path safety net) when the capacity
@@ -340,7 +338,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	scaled := (desiredReplicas != specReplicas)
-	if err := r.updateStatus(ctx, pa, paOriginal, statusReplicas, desiredReplicas, statusAvailable, result.appliedCronPolicies, false, scaled, limited, limitReason, reason); err != nil {
+	if err := r.updateStatus(ctx, pa, paOriginal, statusReplicas, desiredReplicas, statusAvailable, result.appliedCronPolicies, false, scaled, limited, limitReason, reason, warmingUp); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -444,7 +442,7 @@ func (r *Reconciler) doScale(ctx context.Context, sbs *agentsv1alpha1.SandboxSet
 // Suspended condition). It is used as the merge-patch base so that ALL status
 // changes made during this reconciliation — not just those inside this
 // function — are included in the patch and actually persisted.
-func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1alpha1.PoolAutoscaler, currentReplicas, desiredReplicas, available int32, appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus, suspended bool, scaled bool, limited bool, limitReason, limitMessage string) error {
+func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1alpha1.PoolAutoscaler, currentReplicas, desiredReplicas, available int32, appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus, suspended bool, scaled bool, limited bool, limitReason, limitMessage string, warmingUp bool) error {
 	pa.Status.ObservedGeneration = &pa.Generation
 	pa.Status.CurrentReplicas = currentReplicas
 	pa.Status.DesiredReplicas = desiredReplicas
@@ -470,7 +468,7 @@ func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1a
 	// AbleToScale=True — must not overwrite it. ScalingLimited needs no
 	// refresh either while scaling is halted.
 	if !suspended {
-		r.setConditions(pa, desiredReplicas, limited, limitReason, limitMessage)
+		r.setConditions(pa, desiredReplicas, limited, limitReason, limitMessage, warmingUp)
 	}
 
 	if reflect.DeepEqual(pa.Status, paOriginal.Status) {
@@ -482,17 +480,28 @@ func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1a
 }
 
 // setConditions updates the conditions on the PoolAutoscaler.
-func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredReplicas int32, limited bool, limitReason, limitMessage string) {
+func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredReplicas int32, limited bool, limitReason, limitMessage string, warmingUp bool) {
 	now := metav1.Now()
 
-	setCondition(pa, metav1.Condition{
-		Type:               string(agentsv1alpha1.ScalingActive),
-		Status:             metav1.ConditionTrue,
-		LastTransitionTime: now,
-		ObservedGeneration: pa.Generation,
-		Reason:             "ValidPolicy",
-		Message:            "the autoscaler is able to scale",
-	})
+	if warmingUp {
+		setCondition(pa, metav1.Condition{
+			Type:               string(agentsv1alpha1.ScalingActive),
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: now,
+			ObservedGeneration: pa.Generation,
+			Reason:             "InsufficientObservationWindow",
+			Message:            "the observation window has not collected enough samples to make a capacity scaling decision",
+		})
+	} else {
+		setCondition(pa, metav1.Condition{
+			Type:               string(agentsv1alpha1.ScalingActive),
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: now,
+			ObservedGeneration: pa.Generation,
+			Reason:             "ValidPolicy",
+			Message:            "the autoscaler is able to scale",
+		})
+	}
 
 	setCondition(pa, metav1.Condition{
 		Type:               string(agentsv1alpha1.AbleToScale),

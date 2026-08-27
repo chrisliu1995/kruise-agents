@@ -198,7 +198,7 @@ type computeDesiredReplicasResult struct {
 	limitReason string
 }
 
-func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, specReplicas, avgReplicas, avgAvailable int32, sampleCount int) (computeDesiredReplicasResult, error) {
+func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, specReplicas, avgReplicas, avgAvailable int32) (computeDesiredReplicasResult, error) {
 	logger := klog.FromContext(ctx)
 
 	// Evaluate cron policies first — cron takes priority over capacity when triggered.
@@ -531,5 +531,5 @@ func resolveIntOrPercent(val intstr.IntOrString, total int32) int32 {
 	if percent > math.MaxInt32 {
 		return math.MaxInt32
 	}
-	return int32(percent)
+	return int32(percent) // #nosec G115 -- overflow guarded by MaxInt32 check above
 }

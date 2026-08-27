@@ -167,10 +167,6 @@ func TestClampToBounds(t *testing.T) {
 }
 
 func TestComputeDesiredReplicas(t *testing.T) {
-	// A full observation window with the default flags holds
-	// observationWindowSeconds/samplingIntervalSeconds samples.
-	fullWindowSamples := observationWindowSeconds / samplingIntervalSeconds
-
 	tests := []struct {
 		name                string
 		capacityPolicy      *agentsv1alpha1.CapacityPolicy
@@ -179,7 +175,6 @@ func TestComputeDesiredReplicas(t *testing.T) {
 		specReplicas        int32
 		statusReplicas      int32
 		available           int32
-		sampleCount         int // 0 means use a full window
 		expectedDesired     int32
 		expectedReason      string
 		expectedLimitReason string
@@ -254,7 +249,6 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			specReplicas:    5,
 			statusReplicas:  5,
 			available:       4, // below lower=6, deficit=7-4=3
-			sampleCount:     1,
 			expectedDesired: 8, // 5 + 3 = 8 (warm-up check is now in the controller)
 			expectedReason:  "available below lower watermark",
 		},
@@ -395,7 +389,6 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			specReplicas:    10,
 			statusReplicas:  10,
 			available:       9, // above upper=8, excess=9-7=2
-			sampleCount:     1,
 			expectedDesired: 8, // 10-2=8 (warm-up check is now in the controller)
 			expectedReason:  "available above upper watermark",
 		},
@@ -550,13 +543,9 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			pa.Name = "test-pa"
 			pa.Namespace = "default"
 
-			sampleCount := tt.sampleCount
-			if sampleCount == 0 {
-				sampleCount = fullWindowSamples
-			}
 			result, err := r.computeDesiredReplicas(
 				context.Background(), pa,
-				tt.specReplicas, tt.statusReplicas, tt.available, sampleCount,
+				tt.specReplicas, tt.statusReplicas, tt.available,
 			)
 			assert.NoError(t, err)
 			assert.Equal(t, tt.expectedDesired, result.desiredReplicas, "desired replicas mismatch")
@@ -591,13 +580,9 @@ func TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp(t *testing.T) {
 	pa.Name = "test-pa"
 	pa.Namespace = "default"
 
-	// Scale-up now requires a fully populated observation window; pass a full
-	// window's worth of samples.
-	fullWindowSamples := observationWindowSeconds / samplingIntervalSeconds
-
 	// First evaluation: spec=10, status=10, available=0 → triggers scale-up.
 	// deficit = 10 - 0 = 10, desired = 10 + 10 = 20.
-	result, err := r.computeDesiredReplicas(context.Background(), pa, 10, 10, 0, fullWindowSamples)
+	result, err := r.computeDesiredReplicas(context.Background(), pa, 10, 10, 0)
 	require.NoError(t, err)
 	assert.Equal(t, int32(20), result.desiredReplicas)
 	assert.Contains(t, result.reason, "available below lower watermark")
@@ -605,7 +590,7 @@ func TestComputeDesiredReplicas_StuckCreatingNoRepeatScaleUp(t *testing.T) {
 	// After the first scale-up: spec=20, status=10 (still creating), available=0.
 	// Now specReplicas(20) > avgReplicas(10) → the in-progress guard fires.
 	for i := 0; i < 5; i++ {
-		result, err = r.computeDesiredReplicas(context.Background(), pa, 20, 10, 0, fullWindowSamples)
+		result, err = r.computeDesiredReplicas(context.Background(), pa, 20, 10, 0)
 		require.NoError(t, err)
 		assert.Equal(t, int32(20), result.desiredReplicas, "iteration %d must not scale up again", i)
 		assert.Contains(t, result.reason, "waiting for previous scale-up to complete")
