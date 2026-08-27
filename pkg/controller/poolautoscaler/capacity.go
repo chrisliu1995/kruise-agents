@@ -528,5 +528,8 @@ func resolveIntOrPercent(val intstr.IntOrString, total int32) int32 {
 		return val.IntVal
 	}
 	percent, _ := intstr.GetScaledValueFromIntOrPercent(&val, int(total), true)
+	if percent > math.MaxInt32 {
+		return math.MaxInt32
+	}
 	return int32(percent)
 }
