@@ -915,6 +915,12 @@ Final Available = sum(availableReplicas from all samples) / number of samples
 - **Use Case**: General purpose, smooths out temporary fluctuations
 - **Advantage**: Provides stable, representative value
 
+**Warm-up Behavior**:
+
+- The capacity policy only makes scaling decisions once the collected samples span at least half of the observation window (`observationWindowSeconds / 2`). This guard ensures decisions are based on a statistically meaningful history rather than a single transient reading.
+- A time-span threshold is used instead of requiring a fixed sample count: the realized reconcile cadence is always slightly longer than the configured sampling interval, so the theoretical maximum sample count is never reached in steady state. Gating on a fixed count would risk permanently blocking scaling.
+- After a controller restart, the capacity path performs no scaling for roughly half of one observation window while samples accumulate. Cron-triggered scaling is not subject to this warm-up guard, since it represents explicit, time-driven user intent.
+
 **Integration with Stabilization Windows**:
 
 The observation window is separate from but complementary to stabilization windows used in scaling policies:

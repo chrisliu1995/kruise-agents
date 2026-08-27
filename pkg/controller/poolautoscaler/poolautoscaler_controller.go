@@ -181,7 +181,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			Reason:             "Suspended",
 			Message:            "autoscaler is suspended",
 		})
-		if err := r.updateStatus(ctx, pa, paOriginal, pa.Status.CurrentReplicas, pa.Status.DesiredReplicas, pa.Status.CurrentCapacity.Available, nil, true, false, false, ""); err != nil {
+		if err := r.updateStatus(ctx, pa, paOriginal, pa.Status.CurrentReplicas, pa.Status.DesiredReplicas, pa.Status.CurrentCapacity.Available, nil, true, false, false, "", ""); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -250,6 +250,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	statusAvailable := sbs.Status.AvailableReplicas
 
 	avgAvailable, avgReplicas, sampleCount := r.observeAndAggregate(ctx, pa, statusAvailable, statusReplicas)
+
+	// Retrieve the monitor early — needed for the warm-up check and requeue logic.
+	key := types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}
+	monitor := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name)
+
 	result, err := r.computeDesiredReplicas(ctx, pa, specReplicas, avgReplicas, avgAvailable, sampleCount)
 	if err != nil {
 		r.recorder.Eventf(pa, "Warning", "FailedComputeReplicas",
@@ -257,7 +262,36 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	desiredReplicas, limited, limitReason := r.clampToBounds(pa, result.desiredReplicas)
+	// Warm-up guard: capacity path requires the observation window to be
+	// sufficiently populated before making scaling decisions. Cron-triggered
+	// scaling bypasses this check since it represents explicit user intent.
+	if result.source != sourceCron && !monitor.windowIsWarm() {
+		result.desiredReplicas = specReplicas
+		result.reason = "observation window not yet warm enough for capacity scaling"
+		result.limitReason = ""
+		setCondition(pa, metav1.Condition{
+			Type:               string(agentsv1alpha1.ScalingActive),
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+			ObservedGeneration: pa.Generation,
+			Reason:             "InsufficientObservationWindow",
+			Message:            "the observation window has not collected enough samples to make a capacity scaling decision",
+		})
+	}
+
+	// Determine ScalingLimited from the capacity path's limitReason first;
+	// fall back to clampToBounds (for cron path safety net) when the capacity
+	// path did not report a limit.
+	var desiredReplicas int32
+	var limited bool
+	var limitReason string
+	if result.limitReason != "" {
+		desiredReplicas = result.desiredReplicas
+		limited = true
+		limitReason = result.limitReason
+	} else {
+		desiredReplicas, limited, limitReason = r.clampToBounds(pa, result.desiredReplicas)
+	}
 	reason := result.reason
 
 	// Cron-triggered scaling bypasses the stabilization window — cron represents
@@ -306,14 +340,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	scaled := (desiredReplicas != specReplicas)
-	if err := r.updateStatus(ctx, pa, paOriginal, statusReplicas, desiredReplicas, statusAvailable, result.appliedCronPolicies, false, scaled, limited, limitReason); err != nil {
+	if err := r.updateStatus(ctx, pa, paOriginal, statusReplicas, desiredReplicas, statusAvailable, result.appliedCronPolicies, false, scaled, limited, limitReason, reason); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// Requeue aligned with last sample time so that observeAndAggregate
 	// collects a new sample on each reconcile pass.
-	key := types.NamespacedName{Namespace: pa.Namespace, Name: pa.Name}
-	monitor := r.getOrCreateMonitorFor(key, pa.UID, pa.Spec.ScaleTargetRef.Name)
 	nextDue := monitor.getLastSampleAt().Add(time.Duration(samplingIntervalSeconds) * time.Second)
 	requeueAfter := time.Until(nextDue)
 	if requeueAfter <= 0 {
@@ -412,7 +444,7 @@ func (r *Reconciler) doScale(ctx context.Context, sbs *agentsv1alpha1.SandboxSet
 // Suspended condition). It is used as the merge-patch base so that ALL status
 // changes made during this reconciliation — not just those inside this
 // function — are included in the patch and actually persisted.
-func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1alpha1.PoolAutoscaler, currentReplicas, desiredReplicas, available int32, appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus, suspended bool, scaled bool, limited bool, limitReason string) error {
+func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1alpha1.PoolAutoscaler, currentReplicas, desiredReplicas, available int32, appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus, suspended bool, scaled bool, limited bool, limitReason, limitMessage string) error {
 	pa.Status.ObservedGeneration = &pa.Generation
 	pa.Status.CurrentReplicas = currentReplicas
 	pa.Status.DesiredReplicas = desiredReplicas
@@ -438,7 +470,7 @@ func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1a
 	// AbleToScale=True — must not overwrite it. ScalingLimited needs no
 	// refresh either while scaling is halted.
 	if !suspended {
-		r.setConditions(pa, desiredReplicas, limited, limitReason)
+		r.setConditions(pa, desiredReplicas, limited, limitReason, limitMessage)
 	}
 
 	if reflect.DeepEqual(pa.Status, paOriginal.Status) {
@@ -450,7 +482,7 @@ func (r *Reconciler) updateStatus(ctx context.Context, pa, paOriginal *agentsv1a
 }
 
 // setConditions updates the conditions on the PoolAutoscaler.
-func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredReplicas int32, limited bool, limitReason string) {
+func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredReplicas int32, limited bool, limitReason, limitMessage string) {
 	now := metav1.Now()
 
 	setCondition(pa, metav1.Condition{
@@ -472,9 +504,13 @@ func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredRep
 	})
 
 	if limited {
-		bound := "maximum"
-		if limitReason == "TooFewReplicas" {
-			bound = "minimum"
+		msg := limitMessage
+		if msg == "" {
+			bound := "maximum"
+			if limitReason == "TooFewReplicas" {
+				bound = "minimum"
+			}
+			msg = fmt.Sprintf("the desired replica count is limited to the %s %d", bound, desiredReplicas)
 		}
 		setCondition(pa, metav1.Condition{
 			Type:               string(agentsv1alpha1.ScalingLimited),
@@ -482,7 +518,7 @@ func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredRep
 			LastTransitionTime: now,
 			ObservedGeneration: pa.Generation,
 			Reason:             limitReason,
-			Message:            fmt.Sprintf("the desired replica count is limited to the %s %d", bound, desiredReplicas),
+			Message:            msg,
 		})
 	} else {
 		setCondition(pa, metav1.Condition{

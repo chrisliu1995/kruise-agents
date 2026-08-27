@@ -172,16 +172,17 @@ func TestComputeDesiredReplicas(t *testing.T) {
 	fullWindowSamples := observationWindowSeconds / samplingIntervalSeconds
 
 	tests := []struct {
-		name            string
-		capacityPolicy  *agentsv1alpha1.CapacityPolicy
-		minReplicas     int32
-		maxReplicas     int32
-		specReplicas    int32
-		statusReplicas  int32
-		available       int32
-		sampleCount     int // 0 means use a full window
-		expectedDesired int32
-		expectedReason  string
+		name                string
+		capacityPolicy      *agentsv1alpha1.CapacityPolicy
+		minReplicas         int32
+		maxReplicas         int32
+		specReplicas        int32
+		statusReplicas      int32
+		available           int32
+		sampleCount         int // 0 means use a full window
+		expectedDesired     int32
+		expectedReason      string
+		expectedLimitReason string
 	}{
 		{
 			name:            "no scaling policy returns spec unchanged",
@@ -240,7 +241,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			expectedReason:  "available below lower watermark",
 		},
 		{
-			name: "scale-up blocked by insufficient samples",
+			name: "scale-up blocked by insufficient samples (guard removed, scales normally)",
 			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromInt32(7),
 				Tolerance: func() *intstr.IntOrString {
@@ -252,10 +253,10 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			maxReplicas:     20,
 			specReplicas:    5,
 			statusReplicas:  5,
-			available:       4, // below lower=6, but only one sample observed
+			available:       4, // below lower=6, deficit=7-4=3
 			sampleCount:     1,
-			expectedDesired: 5,
-			expectedReason:  "insufficient observation samples for scale-up",
+			expectedDesired: 8, // 5 + 3 = 8 (warm-up check is now in the controller)
+			expectedReason:  "available below lower watermark",
 		},
 		{
 			name: "scale-up clamped to maxReplicas",
@@ -266,13 +267,14 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
-			minReplicas:     2,
-			maxReplicas:     7,
-			specReplicas:    5,
-			statusReplicas:  5,
-			available:       4, // below lower=6, raw desired=8 > max=7
-			expectedDesired: 7,
-			expectedReason:  "scale-up limited by maxReplicas",
+			minReplicas:         2,
+			maxReplicas:         7,
+			specReplicas:        5,
+			statusReplicas:      5,
+			available:           4, // below lower=6, raw desired=8 > max=7
+			expectedDesired:     7,
+			expectedReason:      "scale-up limited by maxReplicas",
+			expectedLimitReason: "TooManyReplicas",
 		},
 		{
 			name: "already at maxReplicas — no scale-up",
@@ -283,13 +285,14 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
-			minReplicas:     2,
-			maxReplicas:     5,
-			specReplicas:    5,
-			statusReplicas:  5,
-			available:       4, // below lower=6, raw desired=8 > max=5=spec
-			expectedDesired: 5,
-			expectedReason:  "already at maxReplicas, scale-up skipped",
+			minReplicas:         2,
+			maxReplicas:         5,
+			specReplicas:        5,
+			statusReplicas:      5,
+			available:           4, // below lower=6, raw desired=8 > max=5=spec
+			expectedDesired:     5,
+			expectedReason:      "already at maxReplicas, scale-up skipped",
+			expectedLimitReason: "TooManyReplicas",
 		},
 		{
 			name: "absolute: all replicas stuck creating — scale up by deficit",
@@ -349,13 +352,14 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
-			minReplicas:     9,
-			maxReplicas:     20,
-			specReplicas:    10,
-			statusReplicas:  10,
-			available:       9, // above upper=8, raw desired=8 < min=9
-			expectedDesired: 9,
-			expectedReason:  "scale-down limited by minReplicas",
+			minReplicas:         9,
+			maxReplicas:         20,
+			specReplicas:        10,
+			statusReplicas:      10,
+			available:           9, // above upper=8, raw desired=8 < min=9
+			expectedDesired:     9,
+			expectedReason:      "scale-down limited by minReplicas",
+			expectedLimitReason: "TooFewReplicas",
 		},
 		{
 			name: "already at minReplicas — no scale-down",
@@ -370,14 +374,15 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			maxReplicas: 40,
 			// Pool pinned at the minimum: spec = status = available = min.
 			// target=10, upper=12; available(20) > upper, raw desired=10 < min=20.
-			specReplicas:    20,
-			statusReplicas:  20,
-			available:       20,
-			expectedDesired: 20,
-			expectedReason:  "already at minReplicas, scale-down skipped",
+			specReplicas:        20,
+			statusReplicas:      20,
+			available:           20,
+			expectedDesired:     20,
+			expectedReason:      "already at minReplicas, scale-down skipped",
+			expectedLimitReason: "", // N5: spec == min, no limit reported
 		},
 		{
-			name: "insufficient samples block scale-down",
+			name: "insufficient samples no longer block scale-down (guard removed)",
 			capacityPolicy: &agentsv1alpha1.CapacityPolicy{
 				TargetAvailable: intstr.FromInt32(7),
 				Tolerance: func() *intstr.IntOrString {
@@ -385,12 +390,14 @@ func TestComputeDesiredReplicas(t *testing.T) {
 					return &v
 				}(),
 			},
+			minReplicas:     5,
+			maxReplicas:     20,
 			specReplicas:    10,
 			statusReplicas:  10,
-			available:       9, // above upper=8, but only one sample observed
+			available:       9, // above upper=8, excess=9-7=2
 			sampleCount:     1,
-			expectedDesired: 10,
-			expectedReason:  "insufficient observation samples for scale-down",
+			expectedDesired: 8, // 10-2=8 (warm-up check is now in the controller)
+			expectedReason:  "available above upper watermark",
 		},
 		{
 			name: "percentage: convergence step 10→7",
@@ -554,6 +561,7 @@ func TestComputeDesiredReplicas(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, tt.expectedDesired, result.desiredReplicas, "desired replicas mismatch")
 			assert.Contains(t, result.reason, tt.expectedReason)
+			assert.Equal(t, tt.expectedLimitReason, result.limitReason, "limitReason mismatch")
 		})
 	}
 }
@@ -914,15 +922,15 @@ func TestPruneSamples(t *testing.T) {
 			expectedAvail: 6,
 		},
 		{
-			name: "boundary - exactly at window edge",
+			name: "boundary - exactly at window edge (inclusive)",
 			setupSamples: func(now time.Time) []sample {
 				return []sample{
-					{timestamp: now.Add(-window), available: 5, statusReplicas: 10}, // exactly at cutoff
+					{timestamp: now.Add(-window), available: 5, statusReplicas: 10}, // exactly at cutoff, now retained
 					{timestamp: now.Add(-window / 3), available: 6, statusReplicas: 10},
 				}
 			},
-			expectedLen:   1,
-			expectedAvail: 6,
+			expectedLen:   2,
+			expectedAvail: 5,
 		},
 		{
 			name: "empty samples",
@@ -945,6 +953,89 @@ func TestPruneSamples(t *testing.T) {
 			if tt.expectedAvail > 0 && tt.expectedLen > 0 {
 				assert.Equal(t, tt.expectedAvail, m.samples[0].available)
 			}
+		})
+	}
+}
+
+func TestWindowIsWarm(t *testing.T) {
+	tests := []struct {
+		name     string
+		samples  []sample
+		expected bool
+	}{
+		{
+			name:     "zero samples",
+			samples:  nil,
+			expected: false,
+		},
+		{
+			name: "single sample",
+			samples: []sample{
+				{timestamp: time.Now()},
+			},
+			expected: false,
+		},
+		{
+			name: "2 samples span 10s (less than half window)",
+			samples: func() []sample {
+				now := time.Now()
+				return []sample{
+					{timestamp: now.Add(-10 * time.Second)},
+					{timestamp: now},
+				}
+			}(),
+			expected: false,
+		},
+		{
+			name: "2 samples span 15s (exactly half window)",
+			samples: func() []sample {
+				now := time.Now()
+				return []sample{
+					{timestamp: now.Add(-15 * time.Second)},
+					{timestamp: now},
+				}
+			}(),
+			expected: true,
+		},
+		{
+			name: "5 samples span 25s",
+			samples: func() []sample {
+				now := time.Now()
+				return []sample{
+					{timestamp: now.Add(-25 * time.Second)},
+					{timestamp: now.Add(-20 * time.Second)},
+					{timestamp: now.Add(-15 * time.Second)},
+					{timestamp: now.Add(-10 * time.Second)},
+					{timestamp: now},
+				}
+			}(),
+			expected: true,
+		},
+		{
+			name: "cadence 6s with 5 samples (span 24s) - previously blocked scenario",
+			samples: func() []sample {
+				now := time.Now()
+				// Simulates reconcile cadence > samplingInterval (6s > 5s).
+				// Under the old sampleCount guard this would permanently block
+				// because only 5 samples fit the window (< expectedSamples=6).
+				return []sample{
+					{timestamp: now.Add(-24 * time.Second)},
+					{timestamp: now.Add(-18 * time.Second)},
+					{timestamp: now.Add(-12 * time.Second)},
+					{timestamp: now.Add(-6 * time.Second)},
+					{timestamp: now},
+				}
+			}(),
+			expected: true, // span=24s >= 15s (half of 30s window)
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &capacityMonitor{
+				samples: tt.samples,
+			}
+			assert.Equal(t, tt.expected, m.windowIsWarm())
 		})
 	}
 }

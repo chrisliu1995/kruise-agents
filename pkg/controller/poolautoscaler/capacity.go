@@ -129,7 +129,7 @@ func (m *capacityMonitor) pruneSamples(now time.Time) {
 	cutoff := now.Add(-window)
 	idx := 0
 	for i, s := range m.samples {
-		if s.timestamp.After(cutoff) {
+		if !s.timestamp.Before(cutoff) {
 			idx = i
 			break
 		}
@@ -138,6 +138,18 @@ func (m *capacityMonitor) pruneSamples(now time.Time) {
 	if idx > 0 {
 		m.samples = m.samples[idx:]
 	}
+}
+
+// windowIsWarm reports whether the collected samples span enough of the
+// observation window to be statistically meaningful.
+func (m *capacityMonitor) windowIsWarm() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.samples) < 2 {
+		return false
+	}
+	span := m.samples[len(m.samples)-1].timestamp.Sub(m.samples[0].timestamp)
+	return span >= time.Duration(observationWindowSeconds)*time.Second/2
 }
 
 // aggregatedValues returns the average available and statusReplicas
@@ -181,6 +193,9 @@ type computeDesiredReplicasResult struct {
 	reason              string
 	appliedCronPolicies []agentsv1alpha1.CronScalingPolicyStatus
 	source              scalingPolicySource // which policy determined the desired replicas
+	// limitReason is "TooManyReplicas" or "TooFewReplicas" when a bound
+	// actively suppresses unmet demand. Empty when not limited.
+	limitReason string
 }
 
 func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alpha1.PoolAutoscaler, specReplicas, avgReplicas, avgAvailable int32, sampleCount int) (computeDesiredReplicasResult, error) {
@@ -199,12 +214,12 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 		// If a cron policy has triggered, use its targetReplicas directly.
 		if reason != ReasonNoCronTriggered {
 			logger.V(3).Info("Cron policy triggered, overriding capacity", "reason", reason, "desired", desired)
-			return computeDesiredReplicasResult{desired, reason, cronStatuses, sourceCron}, nil
+			return computeDesiredReplicasResult{desired, reason, cronStatuses, sourceCron, ""}, nil
 		}
 	}
 
 	if pa.Spec.CapacityPolicy == nil {
-		return computeDesiredReplicasResult{specReplicas, "no scaling policy", cronStatuses, sourceBounds}, nil
+		return computeDesiredReplicasResult{specReplicas, "no scaling policy", cronStatuses, sourceBounds, ""}, nil
 	}
 
 	// Use avgReplicas as the percentage base for watermark calculations.
@@ -236,16 +251,7 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 		// before the warm-up guard so an in-progress scale-up keeps reporting its
 		// specific wait reason even while the observation window is filling up.
 		if specReplicas > avgReplicas {
-			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-up to complete", cronStatuses, sourceCapacity}, nil
-		}
-		// Warm-up guard, symmetric with scale-down below: both directions wait
-		// until the observation window is fully populated (e.g. right after
-		// controller restart), so every capacity decision is based on a complete
-		// statistical picture. The expected trade-off is that the capacity path
-		// performs no scaling for roughly one observation window after a restart.
-		expectedSamples := observationWindowSeconds / samplingIntervalSeconds
-		if sampleCount < expectedSamples {
-			return computeDesiredReplicasResult{specReplicas, "insufficient observation samples for scale-up", cronStatuses, sourceCapacity}, nil
+			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-up to complete", cronStatuses, sourceCapacity, ""}, nil
 		}
 		deficit := targetAvailable - avgAvailable
 		if deficit <= 0 {
@@ -258,11 +264,11 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 		// boundary.
 		if desired > pa.Spec.MaxReplicas {
 			if pa.Spec.MaxReplicas == specReplicas {
-				return computeDesiredReplicasResult{specReplicas, "already at maxReplicas, scale-up skipped", cronStatuses, sourceCapacity}, nil
+				return computeDesiredReplicasResult{specReplicas, "already at maxReplicas, scale-up skipped", cronStatuses, sourceCapacity, "TooManyReplicas"}, nil
 			}
-			return computeDesiredReplicasResult{pa.Spec.MaxReplicas, "scale-up limited by maxReplicas", cronStatuses, sourceCapacity}, nil
+			return computeDesiredReplicasResult{pa.Spec.MaxReplicas, "scale-up limited by maxReplicas", cronStatuses, sourceCapacity, "TooManyReplicas"}, nil
 		}
-		return computeDesiredReplicasResult{desired, "available below lower watermark", cronStatuses, sourceCapacity}, nil
+		return computeDesiredReplicasResult{desired, "available below lower watermark", cronStatuses, sourceCapacity, ""}, nil
 	}
 
 	// Scale down: available exceeded upper watermark.
@@ -271,16 +277,7 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 		// A previous scale-down is still converging (status lags spec) — wait
 		// instead of deriving a target from stale, larger status replicas.
 		if specReplicas < avgReplicas {
-			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-down to complete", cronStatuses, sourceCapacity}, nil
-		}
-		// Warm-up guard, symmetric with scale-up above: both directions wait
-		// until the observation window is fully populated (e.g. right after
-		// controller restart), so every capacity decision is based on a complete
-		// statistical picture. The expected trade-off is that the capacity path
-		// performs no scaling for roughly one observation window after a restart.
-		expectedSamples := observationWindowSeconds / samplingIntervalSeconds
-		if sampleCount < expectedSamples {
-			return computeDesiredReplicasResult{specReplicas, "insufficient observation samples for scale-down", cronStatuses, sourceCapacity}, nil
+			return computeDesiredReplicasResult{specReplicas, "waiting for previous scale-down to complete", cronStatuses, sourceCapacity, ""}, nil
 		}
 		excess := avgAvailable - targetAvailable
 		desired := avgReplicas - excess
@@ -293,15 +290,15 @@ func (r *Reconciler) computeDesiredReplicas(ctx context.Context, pa *agentsv1alp
 		// boundary.
 		if desired < pa.Spec.MinReplicas {
 			if pa.Spec.MinReplicas == specReplicas {
-				return computeDesiredReplicasResult{specReplicas, "already at minReplicas, scale-down skipped", cronStatuses, sourceCapacity}, nil
+				return computeDesiredReplicasResult{specReplicas, "already at minReplicas, scale-down skipped", cronStatuses, sourceCapacity, ""}, nil
 			}
-			return computeDesiredReplicasResult{pa.Spec.MinReplicas, "scale-down limited by minReplicas", cronStatuses, sourceCapacity}, nil
+			return computeDesiredReplicasResult{pa.Spec.MinReplicas, "scale-down limited by minReplicas", cronStatuses, sourceCapacity, "TooFewReplicas"}, nil
 		}
-		return computeDesiredReplicasResult{desired, "available above upper watermark", cronStatuses, sourceCapacity}, nil
+		return computeDesiredReplicasResult{desired, "available above upper watermark", cronStatuses, sourceCapacity, ""}, nil
 	}
 
 	// Within dead zone [lower, upper] — stable, no change.
-	return computeDesiredReplicasResult{specReplicas, "within tolerance", cronStatuses, sourceCapacity}, nil
+	return computeDesiredReplicasResult{specReplicas, "within tolerance", cronStatuses, sourceCapacity, ""}, nil
 }
 
 // computeCronDesiredReplicas evaluates cron policies and returns the desired replicas

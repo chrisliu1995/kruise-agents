@@ -500,7 +500,7 @@ func TestUpdateStatus(t *testing.T) {
 			r := newTestReconciler(pa)
 			paOriginal := pa.DeepCopy()
 
-			err := r.updateStatus(context.Background(), pa, paOriginal, tt.currentReplicas, tt.desiredReplicas, tt.available, nil, tt.suspended, tt.scaled, false, "")
+			err := r.updateStatus(context.Background(), pa, paOriginal, tt.currentReplicas, tt.desiredReplicas, tt.available, nil, tt.suspended, tt.scaled, false, "", "")
 			require.NoError(t, err)
 
 			got := &agentsv1alpha1.PoolAutoscaler{}
@@ -584,7 +584,7 @@ func TestSetConditions(t *testing.T) {
 					MaxReplicas: 20,
 				},
 			}
-			r.setConditions(pa, tt.desiredReplicas, tt.limited, tt.limitReason)
+			r.setConditions(pa, tt.desiredReplicas, tt.limited, tt.limitReason, "")
 
 			// Should have 3 conditions: ScalingActive, AbleToScale, and ScalingLimited
 			assert.Len(t, pa.Status.Conditions, 3)
