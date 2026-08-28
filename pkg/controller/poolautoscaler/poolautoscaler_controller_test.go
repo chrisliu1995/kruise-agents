@@ -206,6 +206,10 @@ func TestReconcile(t *testing.T) {
 			expectError:       "",
 			expectSBSReplicas: int32Ptr(10),
 			expectDesired:     int32Ptr(10),
+			// Counterpart to the warm-up case below: once the window is warm the
+			// capacity policy is genuinely driving scaling, so ScalingActive is True.
+			expectScalingActiveReason: "ValidPolicy",
+			expectScalingActiveStatus: metav1.ConditionTrue,
 		},
 		{
 			name: "scale down - available above upper watermark",
@@ -268,9 +272,10 @@ func TestReconcile(t *testing.T) {
 			req:         ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-pa", Namespace: "default"}},
 			expectError: "",
 			// spec.replicas must stay unchanged: no scale-up during warm-up.
-			expectSBSReplicas:         int32Ptr(5),
+			expectSBSReplicas: int32Ptr(5),
+			// Scaling is genuinely inactive while warming up, so ScalingActive
+			// reports False (the harness default), like the suspended case.
 			expectScalingActiveReason: "InsufficientObservationWindow",
-			expectScalingActiveStatus: metav1.ConditionTrue,
 		},
 	}
 

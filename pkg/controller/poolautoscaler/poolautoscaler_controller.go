@@ -484,9 +484,14 @@ func (r *Reconciler) setConditions(pa *agentsv1alpha1.PoolAutoscaler, desiredRep
 	now := metav1.Now()
 
 	if warmingUp {
+		// While the observation window is filling up the capacity policy makes no
+		// scaling decision at all, so ScalingActive must report False — the same
+		// polarity used for the suspended state. Reporting True here would keep
+		// every alert keyed on "ScalingActive != True" silent precisely while
+		// scaling is frozen, and would contradict the reason in kubectl output.
 		setCondition(pa, metav1.Condition{
 			Type:               string(agentsv1alpha1.ScalingActive),
-			Status:             metav1.ConditionTrue,
+			Status:             metav1.ConditionFalse,
 			LastTransitionTime: now,
 			ObservedGeneration: pa.Generation,
 			Reason:             "InsufficientObservationWindow",
